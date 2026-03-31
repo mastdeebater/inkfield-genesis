@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Inkfield Genesis</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #080c1e; }
+    canvas {
+      display: block;
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+    #overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-end;
+      padding-bottom: 10vh;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 1.5s ease;
+      background: radial-gradient(ellipse 50% 35% at center 85%, rgba(0,0,0,0.6) 0%, rgba(0,0,0,0.3) 50%, transparent 100%);
+    }
+    #overlay.visible { opacity: 1; }
+    #wordmark {
+      position: fixed;
+      top: 0;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 2;
+      padding: 24px 60px 32px;
+      font: 600 18px/1 'Readex Pro', 'Helvetica Neue', sans-serif;
+      color: rgba(255,255,255,0.92);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      opacity: 0;
+      transition: opacity 1.5s ease;
+      background: radial-gradient(ellipse 160px 50px at center 24px, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0.35) 40%, transparent 100%);
+    }
+    #wordmark.visible { opacity: 1; }
+    .headline {
+      font: 300 clamp(28px, 5vw, 56px)/1.15 'Readex Pro', 'Helvetica Neue', sans-serif;
+      color: white;
+      text-align: center;
+      text-shadow: 0 2px 40px rgba(0,0,0,0.6);
+      margin-bottom: 28px;
+    }
+    .cta-row { display: flex; gap: 16px; pointer-events: auto; }
+    .cta-primary {
+      padding: 14px 32px; border: none; border-radius: 10px;
+      background: #d4a040; color: #1a1030;
+      font: 600 16px/1 'Readex Pro', sans-serif; cursor: pointer;
+      transition: transform 120ms ease, box-shadow 120ms ease;
+    }
+    .cta-primary:hover { transform: translateY(-1px); box-shadow: 0 8px 24px rgba(0,0,0,0.3); }
+    .cta-secondary {
+      padding: 14px 32px; border: 1px solid rgba(255,255,255,0.3); border-radius: 10px;
+      background: transparent; color: white;
+      font: 600 16px/1 'Readex Pro', sans-serif; cursor: pointer;
+      transition: border-color 120ms ease;
+    }
+    .cta-secondary:hover { border-color: rgba(255,255,255,0.6); }
+    #attribution {
+      position: fixed;
+      bottom: 12px;
+      right: 16px;
+      z-index: 2;
+      font: 300 11px/1.4 'Readex Pro', 'Helvetica Neue', sans-serif;
+      color: rgba(255,255,255,0.5);
+      text-align: right;
+      opacity: 0;
+      transition: opacity 0.8s ease;
+      background: radial-gradient(ellipse 120px 30px at center, rgba(0,0,0,0.4) 0%, transparent 100%);
+      padding: 6px 12px;
+    }
+    #attribution.visible { opacity: 1; }
+  </style>
+<script type="module" crossorigin src="./index-43nxtjws.js"></script></head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="wordmark">Inkfield</div>
+  <div id="attribution"></div>
+  <div id="overlay">
+    <h1 class="headline">Where words become worlds</h1>
+    <div class="cta-row">
+      <button class="cta-primary">Start Reading</button>
+      <button class="cta-secondary">Start Writing</button>
+    </div>
+  </div>
+  
+</body>
+</html>
