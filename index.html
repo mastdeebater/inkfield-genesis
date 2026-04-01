@@ -100,93 +100,149 @@
 
   <script>
     (function() {
-      // Each entry: [text, holdMs] or a special action object
-      // { fake: 'text to type first', pause: ms, then: 'real text' }
-      const sequence = [
-        { text: 'words become worlds', hold: 3000 },
-        { text: 'writers become authors', hold: 3000 },
-        { text: 'readers become fans', hold: 3000 },
-        { fake: 'authors find...', pause: 1200, then: 'agents find authors', hold: 3000 },
-        { text: 'readers become authors', hold: 3000 },
-        { text: 'stories find readers', hold: 3000 },
-      ];
       const prefix = 'Where ';
       const el = document.getElementById('typewriter');
       if (!el) return;
 
       const TYPE_SPEED = 60;
+      const FAST_TYPE = 30;
+      const SLOW_TYPE = 180;
       const DELETE_SPEED = 35;
+      const FAST_DELETE = 18;
       const PAUSE_BEFORE_TYPE = 400;
+      const HOLD = 3000;
+
+      // Sequence of actions. Each is an array of steps:
+      // { type: 'text', speed?, hold? }
+      // { delete: numberOfChars, speed? }
+      // { pause: ms }
+      const sequence = [
+        // 1. Opening — clean
+        [
+          { type: 'words become worlds', hold: HOLD },
+        ],
+        // 2. The typo — relatable
+        [
+          { type: 'worsd become...', speed: TYPE_SPEED },
+          { pause: 800 },
+          { delete: 14, speed: DELETE_SPEED },
+          { pause: 300 },
+          { type: 'words become worlds', hold: HOLD },
+        ],
+        // 3. Normal
+        [
+          { type: 'writers become authors', hold: HOLD },
+        ],
+        // 4. The overenthusiastic delete
+        [
+          { type: 'readers become completely and utterly obsess\u2014', speed: FAST_TYPE },
+          { pause: 600 },
+          { delete: 48, speed: FAST_DELETE },
+          { pause: 500 },
+          { type: 'readers become fans', hold: HOLD },
+        ],
+        // 5. The fake-out — agents
+        [
+          { type: 'authors find...', speed: TYPE_SPEED },
+          { pause: 1200 },
+          { delete: 15, speed: DELETE_SPEED },
+          { pause: 400 },
+          { type: 'agents find authors', hold: HOLD },
+        ],
+        // 6. The writer's struggle
+        [
+          { type: 'the first draft becomes ', speed: TYPE_SPEED },
+          { type: 'perfect', speed: TYPE_SPEED },
+          { pause: 1000 },
+          { delete: 7, speed: DELETE_SPEED },
+          { pause: 400 },
+          { type: 'the second draft', hold: HOLD },
+        ],
+        // 7. Coffee — fast typing like caffeine hit
+        [
+          { type: 'coffee becomes ', speed: TYPE_SPEED },
+          { type: 'inspiration', speed: FAST_TYPE, hold: HOLD },
+        ],
+        // 8. The slow dramatic one
+        [
+          { type: "'once upon a time' becomes ", speed: TYPE_SPEED },
+          { pause: 600 },
+          { type: 'everything', speed: SLOW_TYPE, hold: HOLD },
+        ],
+        // 9. Back to normal flow
+        [
+          { type: 'readers become authors', hold: HOLD },
+        ],
+        // 10. Stories
+        [
+          { type: 'stories find readers', hold: HOLD },
+        ],
+      ];
 
       let seqIdx = 0;
-      el.textContent = prefix + sequence[0].text;
+      let currentText = sequence[0][sequence[0].length - 1].type || '';
+      el.textContent = prefix + currentText;
 
-      function typeText(text, onDone) {
+      function typeText(text, speed, onDone) {
         let j = 0;
         function tick() {
           if (j >= text.length) { onDone(); return; }
           j++;
-          el.textContent = prefix + text.slice(0, j);
-          setTimeout(tick, TYPE_SPEED);
+          currentText += text[j - 1];
+          el.textContent = prefix + currentText;
+          setTimeout(tick, speed);
         }
         tick();
       }
 
-      function deleteText(text, onDone) {
-        let i = text.length;
+      function deleteChars(count, speed, onDone) {
+        let i = 0;
         function tick() {
-          if (i <= 0) { onDone(); return; }
-          i--;
-          el.textContent = prefix + text.slice(0, i);
-          setTimeout(tick, DELETE_SPEED);
+          if (i >= count || currentText.length === 0) { onDone(); return; }
+          currentText = currentText.slice(0, -1);
+          el.textContent = prefix + currentText;
+          i++;
+          setTimeout(tick, speed);
         }
         tick();
       }
 
-      function runEntry() {
-        const entry = sequence[seqIdx % sequence.length];
-        const currentText = el.textContent.slice(prefix.length);
-
-        // Delete current text
-        deleteText(currentText, function() {
-          setTimeout(function() {
-            if (entry.fake) {
-              // Type the fake text first
-              typeText(entry.fake, function() {
-                // Pause to let it sink in...
-                setTimeout(function() {
-                  // Delete the fake text
-                  deleteText(entry.fake, function() {
-                    setTimeout(function() {
-                      // Type the real text
-                      typeText(entry.then, function() {
-                        setTimeout(function() {
-                          seqIdx++;
-                          runEntry();
-                        }, entry.hold || 3000);
-                      });
-                    }, PAUSE_BEFORE_TYPE);
-                  });
-                }, entry.pause || 1000);
-              });
-            } else {
-              // Normal: just type it
-              typeText(entry.text, function() {
-                setTimeout(function() {
-                  seqIdx++;
-                  runEntry();
-                }, entry.hold || 3000);
-              });
-            }
-          }, PAUSE_BEFORE_TYPE);
-        });
+      function deleteAll(speed, onDone) {
+        deleteChars(currentText.length, speed, onDone);
       }
 
-      // First phrase is already displayed, wait then start cycling
-      setTimeout(function() {
-        seqIdx = 1;
-        runEntry();
-      }, sequence[0].hold);
+      function runSequence() {
+        seqIdx = (seqIdx + 1) % sequence.length;
+        var steps = sequence[seqIdx];
+        var stepIdx = 0;
+
+        // First delete everything from previous phrase
+        deleteAll(DELETE_SPEED, function() {
+          setTimeout(runSteps, PAUSE_BEFORE_TYPE);
+        });
+
+        function runSteps() {
+          if (stepIdx >= steps.length) return;
+          var step = steps[stepIdx];
+          stepIdx++;
+
+          if (step.pause) {
+            setTimeout(runSteps, step.pause);
+          } else if (step.delete) {
+            deleteChars(step.delete, step.speed || DELETE_SPEED, runSteps);
+          } else if (step.type) {
+            typeText(step.type, step.speed || TYPE_SPEED, function() {
+              if (step.hold) {
+                setTimeout(runSequence, step.hold);
+              } else {
+                runSteps();
+              }
+            });
+          }
+        }
+      }
+
+      setTimeout(runSequence, HOLD);
     })();
   </script>
 </body>
