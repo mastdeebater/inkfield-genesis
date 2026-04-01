@@ -292,7 +292,7 @@
               }
             });
           } else if (step.morph) {
-            el.innerHTML = step.morph;
+            el.innerHTML = prefix + step.morph;
             currentText = el.textContent;
             if (step.hold) {
               setTimeout(runSequence, step.hold);
