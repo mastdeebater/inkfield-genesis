@@ -111,72 +111,118 @@
       var FAST_DELETE = 18;
       var PAUSE_BEFORE_TYPE = 400;
       var HOLD = 3000;
-      }
 
       // Sequence of actions. Each is an array of steps:
       // { type: 'text', speed?, hold? }
       // { delete: numberOfChars, speed? }
       // { pause: ms }
+      var LONG_HOLD = 5000;
       var sequence = [
-        // 1. Opening — clean
+        // 1. Opening
         [
-          { type: 'words become worlds', hold: HOLD },
+          { type: 'words become worlds', hold: 8000 },
         ],
-        // 2. The typo — relatable (everyone misspells "definitely")
+        // 2. The typo
         [
           { type: 'dreams become definately...', speed: TYPE_SPEED },
           { pause: 900 },
           { delete: 14, speed: DELETE_SPEED },
           { pause: 300 },
-          { type: 'definitely real', hold: HOLD },
-        ],
-        // 3. Normal
-        [
-          { type: 'writers become authors', hold: HOLD },
-        ],
-        // 4. The overenthusiastic delete
-        [
-          { type: 'readers become completely and utterly obsess\u2014', speed: FAST_TYPE },
-          { pause: 600 },
-          { delete: 48, speed: FAST_DELETE },
-          { pause: 500 },
-          { type: 'readers become fans', hold: HOLD },
-        ],
-        // 5. The fake-out — agents
-        [
-          { type: 'authors find...', speed: TYPE_SPEED },
-          { pause: 1200 },
+          { type: 'definitely real', speed: TYPE_SPEED },
+          { pause: 700 },
           { delete: 15, speed: DELETE_SPEED },
-          { pause: 400 },
-          { type: 'agents find authors', hold: HOLD },
+          { pause: 300 },
+          { type: ' definitely real', hold: LONG_HOLD },
         ],
-        // 6. The writer's struggle
+        // 3. Authors get paid — escalating
+        [
+          { type: 'authors get paid ', speed: TYPE_SPEED },
+          { type: 'tomorrow', speed: SLOW_TYPE },
+          { pause: 1200 },
+          { delete: 8, speed: DELETE_SPEED },
+          { pause: 300 },
+          { morph: 'authors get paid <b>tomorrow</b>' },
+          { pause: 1200 },
+          { morph: 'authors get paid <span style="font-size:1.4em"><b>tomorrow</b></span>' },
+          { pause: 1200 },
+          { morph: 'authors get paid <span style="font-size:1.6em">\ud83d\udcb0\u2728\ud83d\ude4c tomorrow \ud83d\ude4c\u2728\ud83d\udcb0</span>', hold: LONG_HOLD },
+        ],
+        // 4. The overenthusiastic reader
+        [
+          { type: 'readers become completely and hopelessly obsess\u2014', speed: FAST_TYPE },
+          { pause: 600 },
+          { delete: 33, speed: FAST_DELETE },
+          { pause: 600 },
+          { type: 'fans. just fans.', hold: LONG_HOLD },
+        ],
+        // 5. The fake-out
+        [
+          { type: 'authors find ', speed: TYPE_SPEED },
+          { type: 'their car keys', speed: TYPE_SPEED },
+          { pause: 1000 },
+          { delete: 14, speed: DELETE_SPEED },
+          { pause: 400 },
+          { type: 'agents', hold: LONG_HOLD },
+        ],
+        // 6. Writer's struggle
         [
           { type: 'the first draft becomes ', speed: TYPE_SPEED },
-          { type: 'perfect', speed: TYPE_SPEED },
-          { pause: 1000 },
-          { delete: 7, speed: DELETE_SPEED },
-          { pause: 400 },
-          { type: 'the second draft', hold: HOLD },
+          { type: 'a masterpiece', speed: TYPE_SPEED },
+          { pause: 800 },
+          { delete: 13, speed: DELETE_SPEED },
+          { pause: 300 },
+          { type: 'acceptable', speed: TYPE_SPEED },
+          { pause: 600 },
+          { delete: 10, speed: DELETE_SPEED },
+          { pause: 300 },
+          { type: 'the second draft', hold: LONG_HOLD },
         ],
-        // 7. Coffee — fast typing like caffeine hit
+        // 7. Coffee escalation
         [
           { type: 'coffee becomes ', speed: TYPE_SPEED },
-          { type: 'inspiration', speed: FAST_TYPE, hold: HOLD },
+          { type: 'a personality', speed: FAST_TYPE },
+          { pause: 700 },
+          { delete: 13, speed: FAST_DELETE },
+          { type: 'a chapter', speed: FAST_TYPE },
+          { pause: 500 },
+          { delete: 9, speed: FAST_DELETE },
+          { type: 'three chapters', speed: FAST_TYPE },
+          { pause: 400 },
+          { delete: 14, speed: FAST_DELETE },
+          { type: 'a whole novel apparently', speed: FAST_TYPE, hold: LONG_HOLD },
         ],
-        // 8. The slow dramatic one
+        // 8. The dramatic one
         [
           { type: "'once upon a time' becomes ", speed: TYPE_SPEED },
-          { pause: 600 },
-          { type: 'everything', speed: SLOW_TYPE, hold: HOLD },
+          { pause: 800 },
+          { type: 'everything', speed: SLOW_TYPE, hold: LONG_HOLD },
         ],
-        // 9. Back to normal flow
+        // 9. Readers — the gateway drug
         [
-          { type: 'readers become authors', hold: HOLD },
+          { type: 'one more chapter becomes ', speed: TYPE_SPEED },
+          { type: 'sunrise', speed: SLOW_TYPE, hold: LONG_HOLD },
         ],
-        // 10. Stories
+        // 10. The quiet truth
         [
-          { type: 'stories find readers', hold: HOLD },
+          { type: 'your words become ', speed: TYPE_SPEED },
+          { type: "someone else's favourite line", speed: TYPE_SPEED, hold: LONG_HOLD },
+        ],
+        // 11. Every word — with attitude
+        [
+          { type: 'every. single. word. pays. its. author.', speed: 90, hold: LONG_HOLD },
+        ],
+        // 12. Deadlines
+        [
+          { type: 'deadlines become ', speed: TYPE_SPEED },
+          { type: 'suggestions', speed: TYPE_SPEED },
+          { pause: 800 },
+          { delete: 11, speed: DELETE_SPEED },
+          { pause: 300 },
+          { type: 'motivation', hold: LONG_HOLD },
+        ],
+        // 13. Closer
+        [
+          { type: 'stories find their readers', hold: LONG_HOLD },
         ],
       ];
 
@@ -208,7 +254,14 @@
         tick();
       }
 
+      function resetToText() {
+        if (el.innerHTML !== el.textContent) {
+          el.textContent = prefix + currentText;
+        }
+      }
+
       function deleteAll(speed, onDone) {
+        resetToText();
         deleteChars(currentText.length, speed, onDone);
       }
 
@@ -238,6 +291,14 @@
                 runSteps();
               }
             });
+          } else if (step.morph) {
+            el.innerHTML = step.morph;
+            currentText = el.textContent;
+            if (step.hold) {
+              setTimeout(runSequence, step.hold);
+            } else {
+              runSteps();
+            }
           } else {
             runSteps();
           }
