@@ -1596,6 +1596,396 @@ function getFontMeasurementState(font, needsEmojiCorrection) {
   return { cache, fontSize, emojiCorrection };
 }
 
+// src/line-break.ts
+function canBreakAfter(kind) {
+  return kind === "space" || kind === "preserved-space" || kind === "tab" || kind === "zero-width-break" || kind === "soft-hyphen";
+}
+function getTabAdvance(lineWidth, tabStopAdvance) {
+  if (tabStopAdvance <= 0)
+    return 0;
+  const remainder = lineWidth % tabStopAdvance;
+  if (Math.abs(remainder) <= 0.000001)
+    return tabStopAdvance;
+  return tabStopAdvance - remainder;
+}
+function getBreakableAdvance(graphemeWidths, graphemePrefixWidths, graphemeIndex, preferPrefixWidths) {
+  if (!preferPrefixWidths || graphemePrefixWidths === null) {
+    return graphemeWidths[graphemeIndex];
+  }
+  return graphemePrefixWidths[graphemeIndex] - (graphemeIndex > 0 ? graphemePrefixWidths[graphemeIndex - 1] : 0);
+}
+function fitSoftHyphenBreak(graphemeWidths, initialWidth, maxWidth, lineFitEpsilon, discretionaryHyphenWidth, cumulativeWidths) {
+  let fitCount = 0;
+  let fittedWidth = initialWidth;
+  while (fitCount < graphemeWidths.length) {
+    const nextWidth = cumulativeWidths ? initialWidth + graphemeWidths[fitCount] : fittedWidth + graphemeWidths[fitCount];
+    const nextLineWidth = fitCount + 1 < graphemeWidths.length ? nextWidth + discretionaryHyphenWidth : nextWidth;
+    if (nextLineWidth > maxWidth + lineFitEpsilon)
+      break;
+    fittedWidth = nextWidth;
+    fitCount++;
+  }
+  return { fitCount, fittedWidth };
+}
+function walkPreparedLinesSimple(prepared, maxWidth, onLine) {
+  const { widths, kinds, breakableWidths, breakablePrefixWidths } = prepared;
+  if (widths.length === 0)
+    return 0;
+  const engineProfile = getEngineProfile();
+  const lineFitEpsilon = engineProfile.lineFitEpsilon;
+  let lineCount = 0;
+  let lineW = 0;
+  let hasContent = false;
+  let lineStartSegmentIndex = 0;
+  let lineStartGraphemeIndex = 0;
+  let lineEndSegmentIndex = 0;
+  let lineEndGraphemeIndex = 0;
+  let pendingBreakSegmentIndex = -1;
+  let pendingBreakPaintWidth = 0;
+  function clearPendingBreak() {
+    pendingBreakSegmentIndex = -1;
+    pendingBreakPaintWidth = 0;
+  }
+  function emitCurrentLine(endSegmentIndex = lineEndSegmentIndex, endGraphemeIndex = lineEndGraphemeIndex, width = lineW) {
+    lineCount++;
+    onLine?.({
+      startSegmentIndex: lineStartSegmentIndex,
+      startGraphemeIndex: lineStartGraphemeIndex,
+      endSegmentIndex,
+      endGraphemeIndex,
+      width
+    });
+    lineW = 0;
+    hasContent = false;
+    clearPendingBreak();
+  }
+  function startLineAtSegment(segmentIndex, width) {
+    hasContent = true;
+    lineStartSegmentIndex = segmentIndex;
+    lineStartGraphemeIndex = 0;
+    lineEndSegmentIndex = segmentIndex + 1;
+    lineEndGraphemeIndex = 0;
+    lineW = width;
+  }
+  function startLineAtGrapheme(segmentIndex, graphemeIndex, width) {
+    hasContent = true;
+    lineStartSegmentIndex = segmentIndex;
+    lineStartGraphemeIndex = graphemeIndex;
+    lineEndSegmentIndex = segmentIndex;
+    lineEndGraphemeIndex = graphemeIndex + 1;
+    lineW = width;
+  }
+  function appendWholeSegment(segmentIndex, width) {
+    if (!hasContent) {
+      startLineAtSegment(segmentIndex, width);
+      return;
+    }
+    lineW += width;
+    lineEndSegmentIndex = segmentIndex + 1;
+    lineEndGraphemeIndex = 0;
+  }
+  function updatePendingBreak(segmentIndex, segmentWidth) {
+    if (!canBreakAfter(kinds[segmentIndex]))
+      return;
+    pendingBreakSegmentIndex = segmentIndex + 1;
+    pendingBreakPaintWidth = lineW - segmentWidth;
+  }
+  function appendBreakableSegment(segmentIndex) {
+    appendBreakableSegmentFrom(segmentIndex, 0);
+  }
+  function appendBreakableSegmentFrom(segmentIndex, startGraphemeIndex) {
+    const gWidths = breakableWidths[segmentIndex];
+    const gPrefixWidths = breakablePrefixWidths[segmentIndex] ?? null;
+    for (let g = startGraphemeIndex;g < gWidths.length; g++) {
+      const gw = getBreakableAdvance(gWidths, gPrefixWidths, g, engineProfile.preferPrefixWidthsForBreakableRuns);
+      if (!hasContent) {
+        startLineAtGrapheme(segmentIndex, g, gw);
+        continue;
+      }
+      if (lineW + gw > maxWidth + lineFitEpsilon) {
+        emitCurrentLine();
+        startLineAtGrapheme(segmentIndex, g, gw);
+      } else {
+        lineW += gw;
+        lineEndSegmentIndex = segmentIndex;
+        lineEndGraphemeIndex = g + 1;
+      }
+    }
+    if (hasContent && lineEndSegmentIndex === segmentIndex && lineEndGraphemeIndex === gWidths.length) {
+      lineEndSegmentIndex = segmentIndex + 1;
+      lineEndGraphemeIndex = 0;
+    }
+  }
+  let i = 0;
+  while (i < widths.length) {
+    const w = widths[i];
+    const kind = kinds[i];
+    if (!hasContent) {
+      if (w > maxWidth && breakableWidths[i] !== null) {
+        appendBreakableSegment(i);
+      } else {
+        startLineAtSegment(i, w);
+      }
+      updatePendingBreak(i, w);
+      i++;
+      continue;
+    }
+    const newW = lineW + w;
+    if (newW > maxWidth + lineFitEpsilon) {
+      if (canBreakAfter(kind)) {
+        appendWholeSegment(i, w);
+        emitCurrentLine(i + 1, 0, lineW - w);
+        i++;
+        continue;
+      }
+      if (pendingBreakSegmentIndex >= 0) {
+        emitCurrentLine(pendingBreakSegmentIndex, 0, pendingBreakPaintWidth);
+        continue;
+      }
+      if (w > maxWidth && breakableWidths[i] !== null) {
+        emitCurrentLine();
+        appendBreakableSegment(i);
+        i++;
+        continue;
+      }
+      emitCurrentLine();
+      continue;
+    }
+    appendWholeSegment(i, w);
+    updatePendingBreak(i, w);
+    i++;
+  }
+  if (hasContent)
+    emitCurrentLine();
+  return lineCount;
+}
+function walkPreparedLines(prepared, maxWidth, onLine) {
+  if (prepared.simpleLineWalkFastPath) {
+    return walkPreparedLinesSimple(prepared, maxWidth, onLine);
+  }
+  const {
+    widths,
+    lineEndFitAdvances,
+    lineEndPaintAdvances,
+    kinds,
+    breakableWidths,
+    breakablePrefixWidths,
+    discretionaryHyphenWidth,
+    tabStopAdvance,
+    chunks
+  } = prepared;
+  if (widths.length === 0 || chunks.length === 0)
+    return 0;
+  const engineProfile = getEngineProfile();
+  const lineFitEpsilon = engineProfile.lineFitEpsilon;
+  let lineCount = 0;
+  let lineW = 0;
+  let hasContent = false;
+  let lineStartSegmentIndex = 0;
+  let lineStartGraphemeIndex = 0;
+  let lineEndSegmentIndex = 0;
+  let lineEndGraphemeIndex = 0;
+  let pendingBreakSegmentIndex = -1;
+  let pendingBreakFitWidth = 0;
+  let pendingBreakPaintWidth = 0;
+  let pendingBreakKind = null;
+  function clearPendingBreak() {
+    pendingBreakSegmentIndex = -1;
+    pendingBreakFitWidth = 0;
+    pendingBreakPaintWidth = 0;
+    pendingBreakKind = null;
+  }
+  function emitCurrentLine(endSegmentIndex = lineEndSegmentIndex, endGraphemeIndex = lineEndGraphemeIndex, width = lineW) {
+    lineCount++;
+    onLine?.({
+      startSegmentIndex: lineStartSegmentIndex,
+      startGraphemeIndex: lineStartGraphemeIndex,
+      endSegmentIndex,
+      endGraphemeIndex,
+      width
+    });
+    lineW = 0;
+    hasContent = false;
+    clearPendingBreak();
+  }
+  function startLineAtSegment(segmentIndex, width) {
+    hasContent = true;
+    lineStartSegmentIndex = segmentIndex;
+    lineStartGraphemeIndex = 0;
+    lineEndSegmentIndex = segmentIndex + 1;
+    lineEndGraphemeIndex = 0;
+    lineW = width;
+  }
+  function startLineAtGrapheme(segmentIndex, graphemeIndex, width) {
+    hasContent = true;
+    lineStartSegmentIndex = segmentIndex;
+    lineStartGraphemeIndex = graphemeIndex;
+    lineEndSegmentIndex = segmentIndex;
+    lineEndGraphemeIndex = graphemeIndex + 1;
+    lineW = width;
+  }
+  function appendWholeSegment(segmentIndex, width) {
+    if (!hasContent) {
+      startLineAtSegment(segmentIndex, width);
+      return;
+    }
+    lineW += width;
+    lineEndSegmentIndex = segmentIndex + 1;
+    lineEndGraphemeIndex = 0;
+  }
+  function updatePendingBreakForWholeSegment(segmentIndex, segmentWidth) {
+    if (!canBreakAfter(kinds[segmentIndex]))
+      return;
+    const fitAdvance = kinds[segmentIndex] === "tab" ? 0 : lineEndFitAdvances[segmentIndex];
+    const paintAdvance = kinds[segmentIndex] === "tab" ? segmentWidth : lineEndPaintAdvances[segmentIndex];
+    pendingBreakSegmentIndex = segmentIndex + 1;
+    pendingBreakFitWidth = lineW - segmentWidth + fitAdvance;
+    pendingBreakPaintWidth = lineW - segmentWidth + paintAdvance;
+    pendingBreakKind = kinds[segmentIndex];
+  }
+  function appendBreakableSegment(segmentIndex) {
+    appendBreakableSegmentFrom(segmentIndex, 0);
+  }
+  function appendBreakableSegmentFrom(segmentIndex, startGraphemeIndex) {
+    const gWidths = breakableWidths[segmentIndex];
+    const gPrefixWidths = breakablePrefixWidths[segmentIndex] ?? null;
+    for (let g = startGraphemeIndex;g < gWidths.length; g++) {
+      const gw = getBreakableAdvance(gWidths, gPrefixWidths, g, engineProfile.preferPrefixWidthsForBreakableRuns);
+      if (!hasContent) {
+        startLineAtGrapheme(segmentIndex, g, gw);
+        continue;
+      }
+      if (lineW + gw > maxWidth + lineFitEpsilon) {
+        emitCurrentLine();
+        startLineAtGrapheme(segmentIndex, g, gw);
+      } else {
+        lineW += gw;
+        lineEndSegmentIndex = segmentIndex;
+        lineEndGraphemeIndex = g + 1;
+      }
+    }
+    if (hasContent && lineEndSegmentIndex === segmentIndex && lineEndGraphemeIndex === gWidths.length) {
+      lineEndSegmentIndex = segmentIndex + 1;
+      lineEndGraphemeIndex = 0;
+    }
+  }
+  function continueSoftHyphenBreakableSegment(segmentIndex) {
+    if (pendingBreakKind !== "soft-hyphen")
+      return false;
+    const gWidths = breakableWidths[segmentIndex];
+    if (gWidths === null)
+      return false;
+    const fitWidths = engineProfile.preferPrefixWidthsForBreakableRuns ? breakablePrefixWidths[segmentIndex] ?? gWidths : gWidths;
+    const usesPrefixWidths = fitWidths !== gWidths;
+    const { fitCount, fittedWidth } = fitSoftHyphenBreak(fitWidths, lineW, maxWidth, lineFitEpsilon, discretionaryHyphenWidth, usesPrefixWidths);
+    if (fitCount === 0)
+      return false;
+    lineW = fittedWidth;
+    lineEndSegmentIndex = segmentIndex;
+    lineEndGraphemeIndex = fitCount;
+    clearPendingBreak();
+    if (fitCount === gWidths.length) {
+      lineEndSegmentIndex = segmentIndex + 1;
+      lineEndGraphemeIndex = 0;
+      return true;
+    }
+    emitCurrentLine(segmentIndex, fitCount, fittedWidth + discretionaryHyphenWidth);
+    appendBreakableSegmentFrom(segmentIndex, fitCount);
+    return true;
+  }
+  function emitEmptyChunk(chunk) {
+    lineCount++;
+    onLine?.({
+      startSegmentIndex: chunk.startSegmentIndex,
+      startGraphemeIndex: 0,
+      endSegmentIndex: chunk.consumedEndSegmentIndex,
+      endGraphemeIndex: 0,
+      width: 0
+    });
+    clearPendingBreak();
+  }
+  for (let chunkIndex = 0;chunkIndex < chunks.length; chunkIndex++) {
+    const chunk = chunks[chunkIndex];
+    if (chunk.startSegmentIndex === chunk.endSegmentIndex) {
+      emitEmptyChunk(chunk);
+      continue;
+    }
+    hasContent = false;
+    lineW = 0;
+    lineStartSegmentIndex = chunk.startSegmentIndex;
+    lineStartGraphemeIndex = 0;
+    lineEndSegmentIndex = chunk.startSegmentIndex;
+    lineEndGraphemeIndex = 0;
+    clearPendingBreak();
+    let i = chunk.startSegmentIndex;
+    while (i < chunk.endSegmentIndex) {
+      const kind = kinds[i];
+      const w = kind === "tab" ? getTabAdvance(lineW, tabStopAdvance) : widths[i];
+      if (kind === "soft-hyphen") {
+        if (hasContent) {
+          lineEndSegmentIndex = i + 1;
+          lineEndGraphemeIndex = 0;
+          pendingBreakSegmentIndex = i + 1;
+          pendingBreakFitWidth = lineW + discretionaryHyphenWidth;
+          pendingBreakPaintWidth = lineW + discretionaryHyphenWidth;
+          pendingBreakKind = kind;
+        }
+        i++;
+        continue;
+      }
+      if (!hasContent) {
+        if (w > maxWidth && breakableWidths[i] !== null) {
+          appendBreakableSegment(i);
+        } else {
+          startLineAtSegment(i, w);
+        }
+        updatePendingBreakForWholeSegment(i, w);
+        i++;
+        continue;
+      }
+      const newW = lineW + w;
+      if (newW > maxWidth + lineFitEpsilon) {
+        const currentBreakFitWidth = lineW + (kind === "tab" ? 0 : lineEndFitAdvances[i]);
+        const currentBreakPaintWidth = lineW + (kind === "tab" ? w : lineEndPaintAdvances[i]);
+        if (pendingBreakKind === "soft-hyphen" && engineProfile.preferEarlySoftHyphenBreak && pendingBreakFitWidth <= maxWidth + lineFitEpsilon) {
+          emitCurrentLine(pendingBreakSegmentIndex, 0, pendingBreakPaintWidth);
+          continue;
+        }
+        if (pendingBreakKind === "soft-hyphen" && continueSoftHyphenBreakableSegment(i)) {
+          i++;
+          continue;
+        }
+        if (canBreakAfter(kind) && currentBreakFitWidth <= maxWidth + lineFitEpsilon) {
+          appendWholeSegment(i, w);
+          emitCurrentLine(i + 1, 0, currentBreakPaintWidth);
+          i++;
+          continue;
+        }
+        if (pendingBreakSegmentIndex >= 0 && pendingBreakFitWidth <= maxWidth + lineFitEpsilon) {
+          emitCurrentLine(pendingBreakSegmentIndex, 0, pendingBreakPaintWidth);
+          continue;
+        }
+        if (w > maxWidth && breakableWidths[i] !== null) {
+          emitCurrentLine();
+          appendBreakableSegment(i);
+          i++;
+          continue;
+        }
+        emitCurrentLine();
+        continue;
+      }
+      appendWholeSegment(i, w);
+      updatePendingBreakForWholeSegment(i, w);
+      i++;
+    }
+    if (hasContent) {
+      const finalPaintWidth = pendingBreakSegmentIndex === chunk.consumedEndSegmentIndex ? pendingBreakPaintWidth : lineW;
+      emitCurrentLine(chunk.consumedEndSegmentIndex, 0, finalPaintWidth);
+    }
+  }
+  return lineCount;
+}
+
 // src/layout.ts
 var sharedGraphemeSegmenter2 = null;
 var sharedLineTextCaches = new WeakMap;
@@ -1785,6 +2175,80 @@ function prepareInternal(text, font, includeSegments, options) {
 }
 function prepareWithSegments(text, font, options) {
   return prepareInternal(text, font, true, options);
+}
+function getInternalPrepared(prepared) {
+  return prepared;
+}
+function getSegmentGraphemes(segmentIndex, segments, cache) {
+  let graphemes = cache.get(segmentIndex);
+  if (graphemes !== undefined)
+    return graphemes;
+  graphemes = [];
+  const graphemeSegmenter = getSharedGraphemeSegmenter2();
+  for (const gs of graphemeSegmenter.segment(segments[segmentIndex])) {
+    graphemes.push(gs.segment);
+  }
+  cache.set(segmentIndex, graphemes);
+  return graphemes;
+}
+function getLineTextCache(prepared) {
+  let cache = sharedLineTextCaches.get(prepared);
+  if (cache !== undefined)
+    return cache;
+  cache = new Map;
+  sharedLineTextCaches.set(prepared, cache);
+  return cache;
+}
+function lineHasDiscretionaryHyphen(kinds, startSegmentIndex, startGraphemeIndex, endSegmentIndex) {
+  return endSegmentIndex > 0 && kinds[endSegmentIndex - 1] === "soft-hyphen" && !(startSegmentIndex === endSegmentIndex && startGraphemeIndex > 0);
+}
+function buildLineTextFromRange(segments, kinds, cache, startSegmentIndex, startGraphemeIndex, endSegmentIndex, endGraphemeIndex) {
+  let text = "";
+  const endsWithDiscretionaryHyphen = lineHasDiscretionaryHyphen(kinds, startSegmentIndex, startGraphemeIndex, endSegmentIndex);
+  for (let i = startSegmentIndex;i < endSegmentIndex; i++) {
+    if (kinds[i] === "soft-hyphen" || kinds[i] === "hard-break")
+      continue;
+    if (i === startSegmentIndex && startGraphemeIndex > 0) {
+      text += getSegmentGraphemes(i, segments, cache).slice(startGraphemeIndex).join("");
+    } else {
+      text += segments[i];
+    }
+  }
+  if (endGraphemeIndex > 0) {
+    if (endsWithDiscretionaryHyphen)
+      text += "-";
+    text += getSegmentGraphemes(endSegmentIndex, segments, cache).slice(startSegmentIndex === endSegmentIndex ? startGraphemeIndex : 0, endGraphemeIndex).join("");
+  } else if (endsWithDiscretionaryHyphen) {
+    text += "-";
+  }
+  return text;
+}
+function createLayoutLine(prepared, cache, width, startSegmentIndex, startGraphemeIndex, endSegmentIndex, endGraphemeIndex) {
+  return {
+    text: buildLineTextFromRange(prepared.segments, prepared.kinds, cache, startSegmentIndex, startGraphemeIndex, endSegmentIndex, endGraphemeIndex),
+    width,
+    start: {
+      segmentIndex: startSegmentIndex,
+      graphemeIndex: startGraphemeIndex
+    },
+    end: {
+      segmentIndex: endSegmentIndex,
+      graphemeIndex: endGraphemeIndex
+    }
+  };
+}
+function materializeLayoutLine(prepared, cache, line) {
+  return createLayoutLine(prepared, cache, line.width, line.startSegmentIndex, line.startGraphemeIndex, line.endSegmentIndex, line.endGraphemeIndex);
+}
+function layoutWithLines(prepared, maxWidth, lineHeight) {
+  const lines = [];
+  if (prepared.widths.length === 0)
+    return { lineCount: 0, height: 0, lines };
+  const graphemeCache = getLineTextCache(prepared);
+  const lineCount = walkPreparedLines(getInternalPrepared(prepared), maxWidth, (line) => {
+    lines.push(materializeLayoutLine(prepared, graphemeCache, line));
+  });
+  return { lineCount, height: lineCount * lineHeight, lines };
 }
 
 // pages/demos/inkfield-genesis/scene-data.ts
@@ -5805,6 +6269,154 @@ var castleWords = [
   "king,",
   "to"
 ];
+var castleSentences = [
+  { words: ["It", "befell", "in", "the", "days", "of", "Uther", "Pendragon,", "when", "he", "was", "king", "of", "all", "England,", "and", "so", "reigned,", "that", "there", "was", "a", "mighty", "duke", "in", "Cornwall", "that", "held", "war", "against", "him", "long", "time."], text: "It befell in the days of Uther Pendragon, when he was king of all England, and so reigned, that there was a mighty duke in Cornwall that held war against him long time." },
+  { words: ["And", "the", "duke", "was", "called", "the", "Duke", "of", "Tintagil."], text: "And the duke was called the Duke of Tintagil." },
+  { words: ["And", "so", "by", "means", "King", "Uther", "sent", "for", "this", "duke,", "charging", "him", "to", "bring", "his", "wife", "with", "him,", "for", "she", "was", "called", "a", "fair", "lady,", "and", "a", "passing", "wise,", "and", "her", "name", "was", "called", "Igraine."], text: "And so by means King Uther sent for this duke, charging him to bring his wife with him, for she was called a fair lady, and a passing wise, and her name was called Igraine." },
+  { words: ["So", "when", "the", "duke", "and", "his", "wife", "were", "come", "unto", "the", "king,", "by", "the", "means", "of", "great", "lords", "they", "were", "accorded", "both."], text: "So when the duke and his wife were come unto the king, by the means of great lords they were accorded both." },
+  { words: ["The", "king", "liked", "and", "loved", "this", "lady", "well,", "and", "he", "made", "them", "great", "cheer", "out", "of", "measure,", "and", "desired", "to", "have", "lain", "by", "her."], text: "The king liked and loved this lady well, and he made them great cheer out of measure, and desired to have lain by her." },
+  { words: ["But", "she", "was", "a", "passing", "good", "woman,", "and", "would", "not", "assent", "unto", "the", "king."], text: "But she was a passing good woman, and would not assent unto the king." },
+  { words: ["And", "then", "she", "told", "the", "duke", "her", "husband,", "and", "said,", "I", "suppose", "that", "we", "were", "sent", "for", "that", "I", "should", "be", "dishonoured;", "wherefore,", "husband,", "I", "counsel", "you,", "that", "we", "depart", "from", "hence", "suddenly,", "that", "we", "may", "ride", "all", "night", "unto", "our", "own", "castle."], text: "And then she told the duke her husband, and said, I suppose that we were sent for that I should be dishonoured; wherefore, husband, I counsel you, that we depart from hence suddenly, that we may ride all night unto our own castle." },
+  { words: ["And", "in", "like", "wise", "as", "she", "said", "so", "they", "departed,", "that", "neither", "the", "king", "nor", "none", "of", "his", "council", "were", "ware", "of", "their", "departing."], text: "And in like wise as she said so they departed, that neither the king nor none of his council were ware of their departing." },
+  { words: ["All", "so", "soon", "as", "King", "Uther", "knew", "of", "their", "departing", "so", "suddenly,", "he", "was", "wonderly", "wroth."], text: "All so soon as King Uther knew of their departing so suddenly, he was wonderly wroth." },
+  { words: ["Then", "he", "called", "to", "him", "his", "privy", "council,", "and", "told", "them", "of", "the", "sudden", "departing", "of", "the", "duke", "and", "his", "wife."], text: "Then he called to him his privy council, and told them of the sudden departing of the duke and his wife." },
+  { words: ["Then", "they", "advised", "the", "king", "to", "send", "for", "the", "duke", "and", "his", "wife", "by", "a", "great", "charge;", "and", "if", "he", "will", "not", "come", "at", "your", "summons,", "then", "may", "ye", "do", "your", "best,", "then", "have", "ye", "cause", "to", "make", "mighty", "war", "upon", "him."], text: "Then they advised the king to send for the duke and his wife by a great charge; and if he will not come at your summons, then may ye do your best, then have ye cause to make mighty war upon him." },
+  { words: ["So", "that", "was", "done,", "and", "the", "messengers", "had", "their", "answers;", "and", "that", "was", "this", "shortly,", "that", "neither", "he", "nor", "his", "wife", "would", "not", "come", "at", "him."], text: "So that was done, and the messengers had their answers; and that was this shortly, that neither he nor his wife would not come at him." },
+  { words: ["Then", "was", "the", "king", "wonderly", "wroth."], text: "Then was the king wonderly wroth." },
+  { words: ["And", "then", "the", "king", "sent", "him", "plain", "word", "again,", "and", "bade", "him", "be", "ready", "and", "stuff", "him", "and", "garnish", "him,", "for", "within", "forty", "days", "he", "would", "fetch", "him", "out", "of", "the", "biggest", "castle", "that", "he", "hath."], text: "And then the king sent him plain word again, and bade him be ready and stuff him and garnish him, for within forty days he would fetch him out of the biggest castle that he hath." },
+  { words: ["When", "the", "duke", "had", "this", "warning,", "anon", "he", "went", "and", "furnished", "and", "garnished", "two", "strong", "castles", "of", "his,", "of", "the", "which", "the", "one", "hight", "Tintagil,", "and", "the", "other", "castle", "hight", "Terrabil."], text: "When the duke had this warning, anon he went and furnished and garnished two strong castles of his, of the which the one hight Tintagil, and the other castle hight Terrabil." },
+  { words: ["So", "his", "wife", "Dame", "Igraine", "he", "put", "in", "the", "castle", "of", "Tintagil,", "and", "himself", "he", "put", "in", "the", "castle", "of", "Terrabil,", "the", "which", "had", "many", "issues", "and", "posterns", "out."], text: "So his wife Dame Igraine he put in the castle of Tintagil, and himself he put in the castle of Terrabil, the which had many issues and posterns out." },
+  { words: ["Then", "in", "all", "haste", "came", "Uther", "with", "a", "great", "host,", "and", "laid", "a", "siege", "about", "the", "castle", "of", "Terrabil."], text: "Then in all haste came Uther with a great host, and laid a siege about the castle of Terrabil." },
+  { words: ["And", "there", "he", "pight", "many", "pavilions,", "and", "there", "was", "great", "war", "made", "on", "both", "parties,", "and", "much", "people", "slain."], text: "And there he pight many pavilions, and there was great war made on both parties, and much people slain." },
+  { words: ["Then", "for", "pure", "anger", "and", "for", "great", "love", "of", "fair", "Igraine", "the", "king", "Uther", "fell", "sick."], text: "Then for pure anger and for great love of fair Igraine the king Uther fell sick." },
+  { words: ["So", "came", "to", "the", "king", "Uther", "Sir", "Ulfius,", "a", "noble", "knight,", "and", "asked", "the", "king", "why", "he", "was", "sick."], text: "So came to the king Uther Sir Ulfius, a noble knight, and asked the king why he was sick." },
+  { words: ["I", "shall", "tell", "thee,", "said", "the", "king,", "I", "am", "sick", "for", "anger", "and", "for", "love", "of", "fair", "Igraine,", "that", "I", "may", "not", "be", "whole."], text: "I shall tell thee, said the king, I am sick for anger and for love of fair Igraine, that I may not be whole." },
+  { words: ["Well,", "my", "lord,", "said", "Sir", "Ulfius,", "I", "shall", "seek", "Merlin,", "and", "he", "shall", "do", "you", "remedy,", "that", "your", "heart", "shall", "be", "pleased."], text: "Well, my lord, said Sir Ulfius, I shall seek Merlin, and he shall do you remedy, that your heart shall be pleased." },
+  { words: ["So", "Ulfius", "departed,", "and", "by", "adventure", "he", "met", "Merlin", "in", "a", "beggar’s", "array,", "and", "there", "Merlin", "asked", "Ulfius", "whom", "he", "sought."], text: "So Ulfius departed, and by adventure he met Merlin in a beggar’s array, and there Merlin asked Ulfius whom he sought." },
+  { words: ["And", "he", "said", "he", "had", "little", "ado", "to", "tell", "him."], text: "And he said he had little ado to tell him." },
+  { words: ["Well,", "said", "Merlin,", "I", "know", "whom", "thou", "seekest,", "for", "thou", "seekest", "Merlin;", "therefore", "seek", "no", "farther,", "for", "I", "am", "he;", "and", "if", "King", "Uther", "will", "well", "reward", "me,", "and", "be", "sworn", "unto", "me", "to", "fulfil", "my", "desire,", "that", "shall", "be", "his", "honour", "and", "profit", "more", "than", "mine;", "for", "I", "shall", "cause", "him", "to", "have", "all", "his", "desire."], text: "Well, said Merlin, I know whom thou seekest, for thou seekest Merlin; therefore seek no farther, for I am he; and if King Uther will well reward me, and be sworn unto me to fulfil my desire, that shall be his honour and profit more than mine; for I shall cause him to have all his desire." },
+  { words: ["All", "this", "will", "I", "undertake,", "said", "Ulfius,", "that", "there", "shall", "be", "nothing", "reasonable", "but", "thou", "shalt", "have", "thy", "desire."], text: "All this will I undertake, said Ulfius, that there shall be nothing reasonable but thou shalt have thy desire." },
+  { words: ["Well,", "said", "Merlin,", "he", "shall", "have", "his", "intent", "and", "desire."], text: "Well, said Merlin, he shall have his intent and desire." },
+  { words: ["And", "therefore,", "said", "Merlin,", "ride", "on", "your", "way,", "for", "I", "will", "not", "be", "long", "behind."], text: "And therefore, said Merlin, ride on your way, for I will not be long behind." },
+  { words: ["CHAPTER", "II.", "How", "Uther", "Pendragon", "made", "war", "on", "the", "duke", "of", "Cornwall,", "and", "how", "by", "the", "mean", "of", "Merlin", "he", "lay", "by", "the", "duchess", "and", "gat", "Arthur."], text: "CHAPTER II. How Uther Pendragon made war on the duke of Cornwall, and how by the mean of Merlin he lay by the duchess and gat Arthur." },
+  { words: ["Then", "Ulfius", "was", "glad,", "and", "rode", "on", "more", "than", "a", "pace", "till", "that", "he", "came", "to", "King", "Uther", "Pendragon,", "and", "told", "him", "he", "had", "met", "with", "Merlin."], text: "Then Ulfius was glad, and rode on more than a pace till that he came to King Uther Pendragon, and told him he had met with Merlin." },
+  { words: ["Where", "is", "he?", "said", "the", "king."], text: "Where is he? said the king." },
+  { words: ["Sir,", "said", "Ulfius,", "he", "will", "not", "dwell", "long."], text: "Sir, said Ulfius, he will not dwell long." },
+  { words: ["Therewithal", "Ulfius", "was", "ware", "where", "Merlin", "stood", "at", "the", "porch", "of", "the", "pavilion’s", "door."], text: "Therewithal Ulfius was ware where Merlin stood at the porch of the pavilion’s door." },
+  { words: ["And", "then", "Merlin", "was", "bound", "to", "come", "to", "the", "king."], text: "And then Merlin was bound to come to the king." },
+  { words: ["When", "King", "Uther", "saw", "him,", "he", "said", "he", "was", "welcome."], text: "When King Uther saw him, he said he was welcome." },
+  { words: ["Sir,", "said", "Merlin,", "I", "know", "all", "your", "heart", "every", "deal;", "so", "ye", "will", "be", "sworn", "unto", "me", "as", "ye", "be", "a", "true", "king", "anointed,", "to", "fulfil", "my", "desire,", "ye", "shall", "have", "your", "desire."], text: "Sir, said Merlin, I know all your heart every deal; so ye will be sworn unto me as ye be a true king anointed, to fulfil my desire, ye shall have your desire." },
+  { words: ["Then", "the", "king", "was", "sworn", "upon", "the", "Four", "Evangelists."], text: "Then the king was sworn upon the Four Evangelists." },
+  { words: ["Sir,", "said", "Merlin,", "this", "is", "my", "desire:", "the", "first", "night", "that", "ye", "shall", "lie", "by", "Igraine", "ye", "shall", "get", "a", "child", "on", "her,", "and", "when", "that", "is", "born,", "that", "it", "shall", "be", "delivered", "to", "me", "for", "to", "nourish", "there", "as", "I", "will", "have", "it;", "for", "it", "shall", "be", "your", "worship,", "and", "the", "child’s", "avail,", "as", "mickle", "as", "the", "child", "is", "worth."], text: "Sir, said Merlin, this is my desire: the first night that ye shall lie by Igraine ye shall get a child on her, and when that is born, that it shall be delivered to me for to nourish there as I will have it; for it shall be your worship, and the child’s avail, as mickle as the child is worth." },
+  { words: ["I", "will", "well,", "said", "the", "king,", "as", "thou", "wilt", "have", "it."], text: "I will well, said the king, as thou wilt have it." },
+  { words: ["Now", "make", "you", "ready,", "said", "Merlin,", "this", "night", "ye", "shall", "lie", "with", "Igraine", "in", "the", "castle", "of", "Tintagil;", "and", "ye", "shall", "be", "like", "the", "duke", "her", "husband,", "Ulfius", "shall", "be", "like", "Sir", "Brastias,", "a", "knight", "of", "the", "duke’s,", "and", "I", "will", "be", "like", "a", "knight", "that", "hight", "Sir", "Jordanus,", "a", "knight", "of", "the", "duke’s."], text: "Now make you ready, said Merlin, this night ye shall lie with Igraine in the castle of Tintagil; and ye shall be like the duke her husband, Ulfius shall be like Sir Brastias, a knight of the duke’s, and I will be like a knight that hight Sir Jordanus, a knight of the duke’s." },
+  { words: ["But", "wait", "ye", "make", "not", "many", "questions", "with", "her", "nor", "her", "men,", "but", "say", "ye", "are", "diseased,", "and", "so", "hie", "you", "to", "bed,", "and", "rise", "not", "on", "the", "morn", "till", "I", "come", "to", "you,", "for", "the", "castle", "of", "Tintagil", "is", "but", "ten", "miles", "hence;", "so", "this", "was", "done", "as", "they", "devised."], text: "But wait ye make not many questions with her nor her men, but say ye are diseased, and so hie you to bed, and rise not on the morn till I come to you, for the castle of Tintagil is but ten miles hence; so this was done as they devised." },
+  { words: ["But", "the", "duke", "of", "Tintagil", "espied", "how", "the", "king", "rode", "from", "the", "siege", "of", "Terrabil,", "and", "therefore", "that", "night", "he", "issued", "out", "of", "the", "castle", "at", "a", "postern", "for", "to", "have", "distressed", "the", "king’s", "host."], text: "But the duke of Tintagil espied how the king rode from the siege of Terrabil, and therefore that night he issued out of the castle at a postern for to have distressed the king’s host." },
+  { words: ["And", "so,", "through", "his", "own", "issue,", "the", "duke", "himself", "was", "slain", "or", "ever", "the", "king", "came", "at", "the", "castle", "of", "Tintagil."], text: "And so, through his own issue, the duke himself was slain or ever the king came at the castle of Tintagil." },
+  { words: ["So", "after", "the", "death", "of", "the", "duke,", "King", "Uther", "lay", "with", "Igraine", "more", "than", "three", "hours", "after", "his", "death,", "and", "begat", "on", "her", "that", "night", "Arthur,", "and", "on", "day", "came", "Merlin", "to", "the", "king,", "and", "bade", "him", "make", "him", "ready,", "and", "so", "he", "kissed", "the", "lady", "Igraine", "and", "departed", "in", "all", "haste."], text: "So after the death of the duke, King Uther lay with Igraine more than three hours after his death, and begat on her that night Arthur, and on day came Merlin to the king, and bade him make him ready, and so he kissed the lady Igraine and departed in all haste." },
+  { words: ["But", "when", "the", "lady", "heard", "tell", "of", "the", "duke", "her", "husband,", "and", "by", "all", "record", "he", "was", "dead", "or", "ever", "King", "Uther", "came", "to", "her,", "then", "she", "marvelled", "who", "that", "might", "be", "that", "lay", "with", "her", "in", "likeness", "of", "her", "lord;", "so", "she", "mourned", "privily", "and", "held", "her", "peace."], text: "But when the lady heard tell of the duke her husband, and by all record he was dead or ever King Uther came to her, then she marvelled who that might be that lay with her in likeness of her lord; so she mourned privily and held her peace." },
+  { words: ["Then", "all", "the", "barons", "by", "one", "assent", "prayed", "the", "king", "of", "accord", "betwixt", "the", "lady", "Igraine", "and", "him;", "the", "king", "gave", "them", "leave,", "for", "fain", "would", "he", "have", "been", "accorded", "with", "her."], text: "Then all the barons by one assent prayed the king of accord betwixt the lady Igraine and him; the king gave them leave, for fain would he have been accorded with her." },
+  { words: ["So", "the", "king", "put", "all", "the", "trust", "in", "Ulfius", "to", "entreat", "between", "them,", "so", "by", "the", "entreaty", "at", "the", "last", "the", "king", "and", "she", "met", "together."], text: "So the king put all the trust in Ulfius to entreat between them, so by the entreaty at the last the king and she met together." },
+  { words: ["Now", "will", "we", "do", "well,", "said", "Ulfius,", "our", "king", "is", "a", "lusty", "knight", "and", "wifeless,", "and", "my", "lady", "Igraine", "is", "a", "passing", "fair", "lady;", "it", "were", "great", "joy", "unto", "us", "all,", "an", "it", "might", "please", "the", "king", "to", "make", "her", "his", "queen."], text: "Now will we do well, said Ulfius, our king is a lusty knight and wifeless, and my lady Igraine is a passing fair lady; it were great joy unto us all, an it might please the king to make her his queen." },
+  { words: ["Unto", "that", "they", "all", "well", "accorded", "and", "moved", "it", "to", "the", "king."], text: "Unto that they all well accorded and moved it to the king." },
+  { words: ["And", "anon,", "like", "a", "lusty", "knight,", "he", "assented", "thereto", "with", "good", "will,", "and", "so", "in", "all", "haste", "they", "were", "married", "in", "a", "morning", "with", "great", "mirth", "and", "joy."], text: "And anon, like a lusty knight, he assented thereto with good will, and so in all haste they were married in a morning with great mirth and joy." },
+  { words: ["And", "King", "Lot", "of", "Lothian", "and", "of", "Orkney", "then", "wedded", "Margawse", "that", "was", "Gawaine’s", "mother,", "and", "King", "Nentres", "of", "the", "land", "of", "Garlot", "wedded", "Elaine."], text: "And King Lot of Lothian and of Orkney then wedded Margawse that was Gawaine’s mother, and King Nentres of the land of Garlot wedded Elaine." },
+  { words: ["All", "this", "was", "done", "at", "the", "request", "of", "King", "Uther."], text: "All this was done at the request of King Uther." },
+  { words: ["And", "the", "third", "sister", "Morgan", "le", "Fay", "was", "put", "to", "school", "in", "a", "nunnery,", "and", "there", "she", "learned", "so", "much", "that", "she", "was", "a", "great", "clerk", "of", "necromancy."], text: "And the third sister Morgan le Fay was put to school in a nunnery, and there she learned so much that she was a great clerk of necromancy." },
+  { words: ["And", "after", "she", "was", "wedded", "to", "King", "Uriens", "of", "the", "land", "of", "Gore,", "that", "was", "Sir", "Ewain’s", "le", "Blanchemain’s", "father."], text: "And after she was wedded to King Uriens of the land of Gore, that was Sir Ewain’s le Blanchemain’s father." },
+  { words: ["CHAPTER", "III.", "Of", "the", "birth", "of", "King", "Arthur", "and", "of", "his", "nurture."], text: "CHAPTER III. Of the birth of King Arthur and of his nurture." },
+  { words: ["Then", "Queen", "Igraine", "waxed", "daily", "greater", "and", "greater,", "so", "it", "befell", "after", "within", "half", "a", "year,", "as", "King", "Uther", "lay", "by", "his", "queen,", "he", "asked", "her,", "by", "the", "faith", "she", "owed", "to", "him,", "whose", "was", "the", "body;", "then", "she", "sore", "abashed", "to", "give", "answer."], text: "Then Queen Igraine waxed daily greater and greater, so it befell after within half a year, as King Uther lay by his queen, he asked her, by the faith she owed to him, whose was the body; then she sore abashed to give answer." },
+  { words: ["Dismay", "you", "not,", "said", "the", "king,", "but", "tell", "me", "the", "truth,", "and", "I", "shall", "love", "you", "the", "better,", "by", "the", "faith", "of", "my", "body."], text: "Dismay you not, said the king, but tell me the truth, and I shall love you the better, by the faith of my body." },
+  { words: ["Sir,", "said", "she,", "I", "shall", "tell", "you", "the", "truth."], text: "Sir, said she, I shall tell you the truth." },
+  { words: ["The", "same", "night", "that", "my", "lord", "was", "dead,", "the", "hour", "of", "his", "death,", "as", "his", "knights", "record,", "there", "came", "into", "my", "castle", "of", "Tintagil", "a", "man", "like", "my", "lord", "in", "speech", "and", "in", "countenance,", "and", "two", "knights", "with", "him", "in", "likeness", "of", "his", "two", "knights", "Brastias", "and", "Jordanus,", "and", "so", "I", "went", "unto", "bed", "with", "him", "as", "I", "ought", "to", "do", "with", "my", "lord,", "and", "the", "same", "night,", "as", "I", "shall", "answer", "unto", "God,", "this", "child", "was", "begotten", "upon", "me."], text: "The same night that my lord was dead, the hour of his death, as his knights record, there came into my castle of Tintagil a man like my lord in speech and in countenance, and two knights with him in likeness of his two knights Brastias and Jordanus, and so I went unto bed with him as I ought to do with my lord, and the same night, as I shall answer unto God, this child was begotten upon me." },
+  { words: ["That", "is", "truth,", "said", "the", "king,", "as", "ye", "say;", "for", "it", "was", "I", "myself", "that", "came", "in", "the", "likeness,", "and", "therefore", "dismay", "you", "not,", "for", "I", "am", "father", "of", "the", "child;", "and", "there", "he", "told", "her", "all", "the", "cause,", "how", "it", "was", "by", "Merlin’s", "counsel."], text: "That is truth, said the king, as ye say; for it was I myself that came in the likeness, and therefore dismay you not, for I am father of the child; and there he told her all the cause, how it was by Merlin’s counsel." },
+  { words: ["Then", "the", "queen", "made", "great", "joy", "when", "she", "knew", "who", "was", "the", "father", "of", "her", "child."], text: "Then the queen made great joy when she knew who was the father of her child." },
+  { words: ["Soon", "came", "Merlin", "unto", "the", "king,", "and", "said,", "Sir,", "ye", "must", "purvey", "you", "for", "the", "nourishing", "of", "your", "child."], text: "Soon came Merlin unto the king, and said, Sir, ye must purvey you for the nourishing of your child." },
+  { words: ["As", "thou", "wilt,", "said", "the", "king,", "be", "it."], text: "As thou wilt, said the king, be it." },
+  { words: ["Well,", "said", "Merlin,", "I", "know", "a", "lord", "of", "yours", "in", "this", "land,", "that", "is", "a", "passing", "true", "man", "and", "a", "faithful,", "and", "he", "shall", "have", "the", "nourishing", "of", "your", "child,", "and", "his", "name", "is", "Sir", "Ector,", "and", "he", "is", "a", "lord", "of", "fair", "livelihood", "in", "many", "parts", "in", "England", "and", "Wales;", "and", "this", "lord,", "Sir", "Ector,", "let", "him", "be", "sent", "for,", "for", "to", "come", "and", "speak", "with", "you,", "and", "desire", "him", "yourself,", "as", "he", "loveth", "you,", "that", "he", "will", "put", "his", "own", "child", "to", "nourishing", "to", "another", "woman,", "and", "that", "his", "wife", "nourish", "yours."], text: "Well, said Merlin, I know a lord of yours in this land, that is a passing true man and a faithful, and he shall have the nourishing of your child, and his name is Sir Ector, and he is a lord of fair livelihood in many parts in England and Wales; and this lord, Sir Ector, let him be sent for, for to come and speak with you, and desire him yourself, as he loveth you, that he will put his own child to nourishing to another woman, and that his wife nourish yours." },
+  { words: ["And", "when", "the", "child", "is", "born", "let", "it", "be", "delivered", "to", "me", "at", "yonder", "privy", "postern", "unchristened."], text: "And when the child is born let it be delivered to me at yonder privy postern unchristened." },
+  { words: ["So", "like", "as", "Merlin", "devised", "it", "was", "done."], text: "So like as Merlin devised it was done." },
+  { words: ["And", "when", "Sir", "Ector", "was", "come", "he", "made", "fiaunce", "to", "the", "king", "for", "to", "nourish", "the", "child", "like", "as", "the", "king", "desired;", "and", "there", "the", "king", "granted", "Sir", "Ector", "great", "rewards."], text: "And when Sir Ector was come he made fiaunce to the king for to nourish the child like as the king desired; and there the king granted Sir Ector great rewards." },
+  { words: ["Then", "when", "the", "lady", "was", "delivered,", "the", "king", "commanded", "two", "knights", "and", "two", "ladies", "to", "take", "the", "child,", "bound", "in", "a", "cloth", "of", "gold,", "and", "that", "ye", "deliver", "him", "to", "what", "poor", "man", "ye", "meet", "at", "the", "postern", "gate", "of", "the", "castle."], text: "Then when the lady was delivered, the king commanded two knights and two ladies to take the child, bound in a cloth of gold, and that ye deliver him to what poor man ye meet at the postern gate of the castle." },
+  { words: ["So", "the", "child", "was", "delivered", "unto", "Merlin,", "and", "so", "he", "bare", "it", "forth", "unto", "Sir", "Ector,", "and", "made", "an", "holy", "man", "to", "christen", "him,", "and", "named", "him", "Arthur;", "and", "so", "Sir", "Ector’s", "wife", "nourished", "him", "with", "her", "own", "pap."], text: "So the child was delivered unto Merlin, and so he bare it forth unto Sir Ector, and made an holy man to christen him, and named him Arthur; and so Sir Ector’s wife nourished him with her own pap." },
+  { words: ["CHAPTER", "IV.", "Of", "the", "death", "of", "King", "Uther", "Pendragon."], text: "CHAPTER IV. Of the death of King Uther Pendragon." },
+  { words: ["Then", "within", "two", "years", "King", "Uther", "fell", "sick", "of", "a", "great", "malady."], text: "Then within two years King Uther fell sick of a great malady." },
+  { words: ["And", "in", "the", "meanwhile", "his", "enemies", "usurped", "upon", "him,", "and", "did", "a", "great", "battle", "upon", "his", "men,", "and", "slew", "many", "of", "his", "people."], text: "And in the meanwhile his enemies usurped upon him, and did a great battle upon his men, and slew many of his people." },
+  { words: ["Sir,", "said", "Merlin,", "ye", "may", "not", "lie", "so", "as", "ye", "do,", "for", "ye", "must", "to", "the", "field", "though", "ye", "ride", "on", "an", "horse-litter:", "for", "ye", "shall", "never", "have", "the", "better", "of", "your", "enemies", "but", "if", "your", "person", "be", "there,", "and", "then", "shall", "ye", "have", "the", "victory."], text: "Sir, said Merlin, ye may not lie so as ye do, for ye must to the field though ye ride on an horse-litter: for ye shall never have the better of your enemies but if your person be there, and then shall ye have the victory." },
+  { words: ["So", "it", "was", "done", "as", "Merlin", "had", "devised,", "and", "they", "carried", "the", "king", "forth", "in", "an", "horse-litter", "with", "a", "great", "host", "towards", "his", "enemies."], text: "So it was done as Merlin had devised, and they carried the king forth in an horse-litter with a great host towards his enemies." },
+  { words: ["And", "at", "St.", "Albans", "there", "met", "with", "the", "king", "a", "great", "host", "of", "the", "North."], text: "And at St. Albans there met with the king a great host of the North." },
+  { words: ["And", "that", "day", "Sir", "Ulfius", "and", "Sir", "Brastias", "did", "great", "deeds", "of", "arms,", "and", "King", "Uther’s", "men", "overcame", "the", "Northern", "battle", "and", "slew", "many", "people,", "and", "put", "the", "remnant", "to", "flight."], text: "And that day Sir Ulfius and Sir Brastias did great deeds of arms, and King Uther’s men overcame the Northern battle and slew many people, and put the remnant to flight." },
+  { words: ["And", "then", "the", "king", "returned", "unto", "London,", "and", "made", "great", "joy", "of", "his", "victory."], text: "And then the king returned unto London, and made great joy of his victory." },
+  { words: ["And", "then", "he", "fell", "passing", "sore", "sick,", "so", "that", "three", "days", "and", "three", "nights", "he", "was", "speechless:", "wherefore", "all", "the", "barons", "made", "great", "sorrow,", "and", "asked", "Merlin", "what", "counsel", "were", "best."], text: "And then he fell passing sore sick, so that three days and three nights he was speechless: wherefore all the barons made great sorrow, and asked Merlin what counsel were best." },
+  { words: ["There", "is", "none", "other", "remedy,", "said", "Merlin,", "but", "God", "will", "have", "his", "will."], text: "There is none other remedy, said Merlin, but God will have his will." },
+  { words: ["But", "look", "ye", "all", "barons", "be", "before", "King", "Uther", "to-morn,", "and", "God", "and", "I", "shall", "make", "him", "to", "speak."], text: "But look ye all barons be before King Uther to-morn, and God and I shall make him to speak." },
+  { words: ["So", "on", "the", "morn", "all", "the", "barons", "with", "Merlin", "came", "to-fore", "the", "king;", "then", "Merlin", "said", "aloud", "unto", "King", "Uther,", "Sir,", "shall", "your", "son", "Arthur", "be", "king", "after", "your", "days,", "of", "this", "realm", "with", "all", "the", "appurtenance?"], text: "So on the morn all the barons with Merlin came to-fore the king; then Merlin said aloud unto King Uther, Sir, shall your son Arthur be king after your days, of this realm with all the appurtenance?" },
+  { words: ["Then", "Uther", "Pendragon", "turned", "him,", "and", "said", "in", "hearing", "of", "them", "all,", "I", "give", "him", "God’s", "blessing", "and", "mine,", "and", "bid", "him", "pray", "for", "my", "soul,", "and", "righteously", "and", "worshipfully", "that", "he", "claim", "the", "crown,", "upon", "forfeiture", "of", "my", "blessing;", "and", "therewith", "he", "yielded", "up", "the", "ghost,", "and", "then", "was", "he", "interred", "as", "longed", "to", "a", "king."], text: "Then Uther Pendragon turned him, and said in hearing of them all, I give him God’s blessing and mine, and bid him pray for my soul, and righteously and worshipfully that he claim the crown, upon forfeiture of my blessing; and therewith he yielded up the ghost, and then was he interred as longed to a king." },
+  { words: ["Wherefore", "the", "queen,", "fair", "Igraine,", "made", "great", "sorrow,", "and", "all", "the", "barons."], text: "Wherefore the queen, fair Igraine, made great sorrow, and all the barons." },
+  { words: ["CHAPTER", "V.", "How", "Arthur", "was", "chosen", "king,", "and", "of", "wonders", "and", "marvels", "of", "a", "sword", "taken", "out", "of", "a", "stone", "by", "the", "said", "Arthur."], text: "CHAPTER V. How Arthur was chosen king, and of wonders and marvels of a sword taken out of a stone by the said Arthur." },
+  { words: ["Then", "stood", "the", "realm", "in", "great", "jeopardy", "long", "while,", "for", "every", "lord", "that", "was", "mighty", "of", "men", "made", "him", "strong,", "and", "many", "weened", "to", "have", "been", "king."], text: "Then stood the realm in great jeopardy long while, for every lord that was mighty of men made him strong, and many weened to have been king." },
+  { words: ["Then", "Merlin", "went", "to", "the", "Archbishop", "of", "Canterbury,", "and", "counselled", "him", "for", "to", "send", "for", "all", "the", "lords", "of", "the", "realm,", "and", "all", "the", "gentlemen", "of", "arms,", "that", "they", "should", "to", "London", "come", "by", "Christmas,", "upon", "pain", "of", "cursing;", "and", "for", "this", "cause,", "that", "Jesus,", "that", "was", "born", "on", "that", "night,", "that", "he", "would", "of", "his", "great", "mercy", "show", "some", "miracle,", "as", "he", "was", "come", "to", "be", "king", "of", "mankind,", "for", "to", "show", "some", "miracle", "who", "should", "be", "rightwise", "king", "of", "this", "realm."], text: "Then Merlin went to the Archbishop of Canterbury, and counselled him for to send for all the lords of the realm, and all the gentlemen of arms, that they should to London come by Christmas, upon pain of cursing; and for this cause, that Jesus, that was born on that night, that he would of his great mercy show some miracle, as he was come to be king of mankind, for to show some miracle who should be rightwise king of this realm." },
+  { words: ["So", "the", "Archbishop,", "by", "the", "advice", "of", "Merlin,", "sent", "for", "all", "the", "lords", "and", "gentlemen", "of", "arms", "that", "they", "should", "come", "by", "Christmas", "even", "unto", "London."], text: "So the Archbishop, by the advice of Merlin, sent for all the lords and gentlemen of arms that they should come by Christmas even unto London." },
+  { words: ["And", "many", "of", "them", "made", "them", "clean", "of", "their", "life,", "that", "their", "prayer", "might", "be", "the", "more", "acceptable", "unto", "God."], text: "And many of them made them clean of their life, that their prayer might be the more acceptable unto God." },
+  { words: ["So", "in", "the", "greatest", "church", "of", "London,", "whether", "it", "were", "Paul’s", "or", "not", "the", "French", "book", "maketh", "no", "mention,", "all", "the", "estates", "were", "long", "or", "day", "in", "the", "church", "for", "to", "pray."], text: "So in the greatest church of London, whether it were Paul’s or not the French book maketh no mention, all the estates were long or day in the church for to pray." },
+  { words: ["And", "when", "matins", "and", "the", "first", "mass", "was", "done,", "there", "was", "seen", "in", "the", "churchyard,", "against", "the", "high", "altar,", "a", "great", "stone", "four", "square,", "like", "unto", "a", "marble", "stone;", "and", "in", "midst", "thereof", "was", "like", "an", "anvil", "of", "steel", "a", "foot", "on", "high,", "and", "therein", "stuck", "a", "fair", "sword", "naked", "by", "the", "point,", "and", "letters", "there", "were", "written", "in", "gold", "about", "the", "sword", "that", "said", "thus:—Whoso", "pulleth", "out", "this", "sword", "of", "this", "stone", "and", "anvil,", "is", "rightwise", "king", "born", "of", "all", "England."], text: "And when matins and the first mass was done, there was seen in the churchyard, against the high altar, a great stone four square, like unto a marble stone; and in midst thereof was like an anvil of steel a foot on high, and therein stuck a fair sword naked by the point, and letters there were written in gold about the sword that said thus:—Whoso pulleth out this sword of this stone and anvil, is rightwise king born of all England." },
+  { words: ["Then", "the", "people", "marvelled,", "and", "told", "it", "to", "the", "Archbishop."], text: "Then the people marvelled, and told it to the Archbishop." },
+  { words: ["I", "command,", "said", "the", "Archbishop,", "that", "ye", "keep", "you", "within", "your", "church", "and", "pray", "unto", "God", "still,", "that", "no", "man", "touch", "the", "sword", "till", "the", "high", "mass", "be", "all", "done."], text: "I command, said the Archbishop, that ye keep you within your church and pray unto God still, that no man touch the sword till the high mass be all done." },
+  { words: ["So", "when", "all", "masses", "were", "done", "all", "the", "lords", "went", "to", "behold", "the", "stone", "and", "the", "sword."], text: "So when all masses were done all the lords went to behold the stone and the sword." },
+  { words: ["And", "when", "they", "saw", "the", "scripture", "some", "assayed,", "such", "as", "would", "have", "been", "king."], text: "And when they saw the scripture some assayed, such as would have been king." },
+  { words: ["But", "none", "might", "stir", "the", "sword", "nor", "move", "it."], text: "But none might stir the sword nor move it." },
+  { words: ["He", "is", "not", "here,", "said", "the", "Archbishop,", "that", "shall", "achieve", "the", "sword,", "but", "doubt", "not", "God", "will", "make", "him", "known."], text: "He is not here, said the Archbishop, that shall achieve the sword, but doubt not God will make him known." },
+  { words: ["But", "this", "is", "my", "counsel,", "said", "the", "Archbishop,", "that", "we", "let", "purvey", "ten", "knights,", "men", "of", "good", "fame,", "and", "they", "to", "keep", "this", "sword."], text: "But this is my counsel, said the Archbishop, that we let purvey ten knights, men of good fame, and they to keep this sword." },
+  { words: ["So", "it", "was", "ordained,", "and", "then", "there", "was", "made", "a", "cry,", "that", "every", "man", "should", "assay", "that", "would,", "for", "to", "win", "the", "sword."], text: "So it was ordained, and then there was made a cry, that every man should assay that would, for to win the sword." },
+  { words: ["And", "upon", "New", "Year’s", "Day", "the", "barons", "let", "make", "a", "jousts", "and", "a", "tournament,", "that", "all", "knights", "that", "would", "joust", "or", "tourney", "there", "might", "play,", "and", "all", "this", "was", "ordained", "for", "to", "keep", "the", "lords", "together", "and", "the", "commons,", "for", "the", "Archbishop", "trusted", "that", "God", "would", "make", "him", "known", "that", "should", "win", "the", "sword."], text: "And upon New Year’s Day the barons let make a jousts and a tournament, that all knights that would joust or tourney there might play, and all this was ordained for to keep the lords together and the commons, for the Archbishop trusted that God would make him known that should win the sword." },
+  { words: ["So", "upon", "New", "Year’s", "Day,", "when", "the", "service", "was", "done,", "the", "barons", "rode", "unto", "the", "field,", "some", "to", "joust", "and", "some", "to", "tourney,", "and", "so", "it", "happened", "that", "Sir", "Ector,", "that", "had", "great", "livelihood", "about", "London,", "rode", "unto", "the", "jousts,", "and", "with", "him", "rode", "Sir", "Kay", "his", "son,", "and", "young", "Arthur", "that", "was", "his", "nourished", "brother;", "and", "Sir", "Kay", "was", "made", "knight", "at", "All", "Hallowmass", "afore."], text: "So upon New Year’s Day, when the service was done, the barons rode unto the field, some to joust and some to tourney, and so it happened that Sir Ector, that had great livelihood about London, rode unto the jousts, and with him rode Sir Kay his son, and young Arthur that was his nourished brother; and Sir Kay was made knight at All Hallowmass afore." },
+  { words: ["So", "as", "they", "rode", "to", "the", "jousts-ward,", "Sir", "Kay", "lost", "his", "sword,", "for", "he", "had", "left", "it", "at", "his", "father’s", "lodging,", "and", "so", "he", "prayed", "young", "Arthur", "for", "to", "ride", "for", "his", "sword."], text: "So as they rode to the jousts-ward, Sir Kay lost his sword, for he had left it at his father’s lodging, and so he prayed young Arthur for to ride for his sword." },
+  { words: ["I", "will", "well,", "said", "Arthur,", "and", "rode", "fast", "after", "the", "sword,", "and", "when", "he", "came", "home,", "the", "lady", "and", "all", "were", "out", "to", "see", "the", "jousting."], text: "I will well, said Arthur, and rode fast after the sword, and when he came home, the lady and all were out to see the jousting." },
+  { words: ["Then", "was", "Arthur", "wroth,", "and", "said", "to", "himself,", "I", "will", "ride", "to", "the", "churchyard,", "and", "take", "the", "sword", "with", "me", "that", "sticketh", "in", "the", "stone,", "for", "my", "brother", "Sir", "Kay", "shall", "not", "be", "without", "a", "sword", "this", "day."], text: "Then was Arthur wroth, and said to himself, I will ride to the churchyard, and take the sword with me that sticketh in the stone, for my brother Sir Kay shall not be without a sword this day." },
+  { words: ["So", "when", "he", "came", "to", "the", "churchyard,", "Sir", "Arthur", "alighted", "and", "tied", "his", "horse", "to", "the", "stile,", "and", "so", "he", "went", "to", "the", "tent,", "and", "found", "no", "knights", "there,", "for", "they", "were", "at", "the", "jousting."], text: "So when he came to the churchyard, Sir Arthur alighted and tied his horse to the stile, and so he went to the tent, and found no knights there, for they were at the jousting." },
+  { words: ["And", "so", "he", "handled", "the", "sword", "by", "the", "handles,", "and", "lightly", "and", "fiercely", "pulled", "it", "out", "of", "the", "stone,", "and", "took", "his", "horse", "and", "rode", "his", "way", "until", "he", "came", "to", "his", "brother", "Sir", "Kay,", "and", "delivered", "him", "the", "sword."], text: "And so he handled the sword by the handles, and lightly and fiercely pulled it out of the stone, and took his horse and rode his way until he came to his brother Sir Kay, and delivered him the sword." },
+  { words: ["And", "as", "soon", "as", "Sir", "Kay", "saw", "the", "sword,", "he", "wist", "well", "it", "was", "the", "sword", "of", "the", "stone,", "and", "so", "he", "rode", "to", "his", "father", "Sir", "Ector,", "and", "said:", "Sir,", "lo", "here", "is", "the", "sword", "of", "the", "stone,", "wherefore", "I", "must", "be", "king", "of", "this", "land."], text: "And as soon as Sir Kay saw the sword, he wist well it was the sword of the stone, and so he rode to his father Sir Ector, and said: Sir, lo here is the sword of the stone, wherefore I must be king of this land." },
+  { words: ["When", "Sir", "Ector", "beheld", "the", "sword,", "he", "returned", "again", "and", "came", "to", "the", "church,", "and", "there", "they", "alighted", "all", "three,", "and", "went", "into", "the", "church."], text: "When Sir Ector beheld the sword, he returned again and came to the church, and there they alighted all three, and went into the church." },
+  { words: ["And", "anon", "he", "made", "Sir", "Kay", "swear", "upon", "a", "book", "how", "he", "came", "to", "that", "sword."], text: "And anon he made Sir Kay swear upon a book how he came to that sword." },
+  { words: ["Sir,", "said", "Sir", "Kay,", "by", "my", "brother", "Arthur,", "for", "he", "brought", "it", "to", "me."], text: "Sir, said Sir Kay, by my brother Arthur, for he brought it to me." },
+  { words: ["How", "gat", "ye", "this", "sword?", "said", "Sir", "Ector", "to", "Arthur."], text: "How gat ye this sword? said Sir Ector to Arthur." },
+  { words: ["Sir,", "I", "will", "tell", "you."], text: "Sir, I will tell you." },
+  { words: ["When", "I", "came", "home", "for", "my", "brother’s", "sword,", "I", "found", "nobody", "at", "home", "to", "deliver", "me", "his", "sword;", "and", "so", "I", "thought", "my", "brother", "Sir", "Kay", "should", "not", "be", "swordless,", "and", "so", "I", "came", "hither", "eagerly", "and", "pulled", "it", "out", "of", "the", "stone", "without", "any", "pain."], text: "When I came home for my brother’s sword, I found nobody at home to deliver me his sword; and so I thought my brother Sir Kay should not be swordless, and so I came hither eagerly and pulled it out of the stone without any pain." },
+  { words: ["Found", "ye", "any", "knights", "about", "this", "sword?", "said", "Sir", "Ector."], text: "Found ye any knights about this sword? said Sir Ector." },
+  { words: ["Nay,", "said", "Arthur."], text: "Nay, said Arthur." },
+  { words: ["Now,", "said", "Sir", "Ector", "to", "Arthur,", "I", "understand", "ye", "must", "be", "king", "of", "this", "land."], text: "Now, said Sir Ector to Arthur, I understand ye must be king of this land." },
+  { words: ["Wherefore", "I,", "said", "Arthur,", "and", "for", "what", "cause?"], text: "Wherefore I, said Arthur, and for what cause?" },
+  { words: ["Sir,", "said", "Ector,", "for", "God", "will", "have", "it", "so;", "for", "there", "should", "never", "man", "have", "drawn", "out", "this", "sword,", "but", "he", "that", "shall", "be", "rightwise", "king", "of", "this", "land."], text: "Sir, said Ector, for God will have it so; for there should never man have drawn out this sword, but he that shall be rightwise king of this land." },
+  { words: ["Now", "let", "me", "see", "whether", "ye", "can", "put", "the", "sword", "there", "as", "it", "was,", "and", "pull", "it", "out", "again."], text: "Now let me see whether ye can put the sword there as it was, and pull it out again." },
+  { words: ["That", "is", "no", "mastery,", "said", "Arthur,", "and", "so", "he", "put", "it", "in", "the", "stone;", "wherewithal", "Sir", "Ector", "assayed", "to", "pull", "out", "the", "sword", "and", "failed."], text: "That is no mastery, said Arthur, and so he put it in the stone; wherewithal Sir Ector assayed to pull out the sword and failed." },
+  { words: ["CHAPTER", "VI.", "How", "King", "Arthur", "pulled", "out", "the", "sword", "divers", "times."], text: "CHAPTER VI. How King Arthur pulled out the sword divers times." },
+  { words: ["Now", "assay,", "said", "Sir", "Ector", "unto", "Sir", "Kay."], text: "Now assay, said Sir Ector unto Sir Kay." },
+  { words: ["And", "anon", "he", "pulled", "at", "the", "sword", "with", "all", "his", "might;", "but", "it", "would", "not", "be."], text: "And anon he pulled at the sword with all his might; but it would not be." },
+  { words: ["Now", "shall", "ye", "assay,", "said", "Sir", "Ector", "to", "Arthur."], text: "Now shall ye assay, said Sir Ector to Arthur." },
+  { words: ["I", "will", "well,", "said", "Arthur,", "and", "pulled", "it", "out", "easily."], text: "I will well, said Arthur, and pulled it out easily." },
+  { words: ["And", "therewithal", "Sir", "Ector", "knelt", "down", "to", "the", "earth,", "and", "Sir", "Kay."], text: "And therewithal Sir Ector knelt down to the earth, and Sir Kay." },
+  { words: ["Alas,", "said", "Arthur,", "my", "own", "dear", "father", "and", "brother,", "why", "kneel", "ye", "to", "me?"], text: "Alas, said Arthur, my own dear father and brother, why kneel ye to me?" },
+  { words: ["Nay,", "nay,", "my", "lord", "Arthur,", "it", "is", "not", "so;", "I", "was", "never", "your", "father", "nor", "of", "your", "blood,", "but", "I", "wot", "well", "ye", "are", "of", "an", "higher", "blood", "than", "I", "weened", "ye", "were."], text: "Nay, nay, my lord Arthur, it is not so; I was never your father nor of your blood, but I wot well ye are of an higher blood than I weened ye were." },
+  { words: ["And", "then", "Sir", "Ector", "told", "him", "all,", "how", "he", "was", "betaken", "him", "for", "to", "nourish", "him,", "and", "by", "whose", "commandment,", "and", "by", "Merlin’s", "deliverance."], text: "And then Sir Ector told him all, how he was betaken him for to nourish him, and by whose commandment, and by Merlin’s deliverance." },
+  { words: ["Then", "Arthur", "made", "great", "dole", "when", "he", "understood", "that", "Sir", "Ector", "was", "not", "his", "father."], text: "Then Arthur made great dole when he understood that Sir Ector was not his father." },
+  { words: ["Sir,", "said", "Ector", "unto", "Arthur,", "will", "ye", "be", "my", "good", "and", "gracious", "lord", "when", "ye", "are", "king?"], text: "Sir, said Ector unto Arthur, will ye be my good and gracious lord when ye are king?" },
+  { words: ["Else", "were", "I", "to", "blame,", "said", "Arthur,", "for", "ye", "are", "the", "man", "in", "the", "world", "that", "I", "am", "most", "beholden", "to,", "and", "my", "good", "lady", "and", "mother", "your", "wife,", "that", "as", "well", "as", "her", "own", "hath", "fostered", "me", "and", "kept."], text: "Else were I to blame, said Arthur, for ye are the man in the world that I am most beholden to, and my good lady and mother your wife, that as well as her own hath fostered me and kept." },
+  { words: ["And", "if", "ever", "it", "be", "God’s", "will", "that", "I", "be", "king", "as", "ye", "say,", "ye", "shall", "desire", "of", "me", "what", "I", "may", "do,", "and", "I", "shall", "not", "fail", "you;", "God", "forbid", "I", "should", "fail", "you", "Sir,", "said", "Sir", "Ector,", "I", "will", "ask", "no", "more", "of", "you,", "but", "that", "ye", "will", "make", "my", "son,", "your", "foster", "brother,", "Sir", "Kay,", "seneschal", "of", "all", "your", "lands."], text: "And if ever it be God’s will that I be king as ye say, ye shall desire of me what I may do, and I shall not fail you; God forbid I should fail you Sir, said Sir Ector, I will ask no more of you, but that ye will make my son, your foster brother, Sir Kay, seneschal of all your lands." },
+  { words: ["That", "shall", "be", "done,", "said", "Arthur,", "and", "more,", "by", "the", "faith", "of", "my", "body,", "that", "never", "man", "shall", "have", "that", "office", "but", "he,", "while", "he", "and", "I", "live."], text: "That shall be done, said Arthur, and more, by the faith of my body, that never man shall have that office but he, while he and I live." },
+  { words: ["Therewithal", "they", "went", "unto", "the", "Archbishop,", "and", "told", "him", "how", "the", "sword", "was", "achieved,", "and", "by", "whom;", "and", "on", "Twelfth-day", "all", "the", "barons", "came", "thither,", "and", "to", "assay", "to", "take", "the", "sword,", "who", "that", "would", "assay."], text: "Therewithal they went unto the Archbishop, and told him how the sword was achieved, and by whom; and on Twelfth-day all the barons came thither, and to assay to take the sword, who that would assay." },
+  { words: ["But", "there", "afore", "them", "all,", "there", "might", "none", "take", "it", "out", "but", "Arthur;", "wherefore", "there", "were", "many", "lords", "wroth,", "and", "said", "it", "was", "great", "shame", "unto", "them", "all", "and", "the", "realm,", "to", "be", "overgoverned", "with", "a", "boy", "of", "no", "high", "blood", "born."], text: "But there afore them all, there might none take it out but Arthur; wherefore there were many lords wroth, and said it was great shame unto them all and the realm, to be overgoverned with a boy of no high blood born." },
+  { words: ["And", "so", "they", "fell", "out", "at", "that", "time", "that", "it", "was", "put", "off", "till", "Candlemas", "and", "then", "all", "the", "barons", "should", "meet", "there", "again;", "but", "always", "the", "ten", "knights", "were", "ordained", "to", "watch", "the", "sword", "day", "and", "night,", "and", "so", "they", "set", "a", "pavilion", "over", "the", "stone", "and", "the", "sword,", "and", "five", "always", "watched."], text: "And so they fell out at that time that it was put off till Candlemas and then all the barons should meet there again; but always the ten knights were ordained to watch the sword day and night, and so they set a pavilion over the stone and the sword, and five always watched." },
+  { words: ["So", "at", "Candlemas", "many", "more", "great", "lords", "came", "thither", "for", "to", "have", "won", "the", "sword,", "but", "there", "might", "none", "prevail."], text: "So at Candlemas many more great lords came thither for to have won the sword, but there might none prevail." },
+  { words: ["And", "right", "as", "Arthur", "did", "at", "Christmas,", "he", "did", "at", "Candlemas,", "and", "pulled", "out", "the", "sword", "easily,", "whereof", "the", "barons", "were", "sore", "aggrieved", "and", "put", "it", "off", "in", "delay", "till", "the", "high", "feast", "of", "Easter."], text: "And right as Arthur did at Christmas, he did at Candlemas, and pulled out the sword easily, whereof the barons were sore aggrieved and put it off in delay till the high feast of Easter." },
+  { words: ["And", "as", "Arthur", "sped", "before,", "so", "did", "he", "at", "Easter;", "yet", "there", "were", "some", "of", "the", "great", "lords", "had", "indignation", "that", "Arthur", "should", "be", "king,", "and", "put", "it", "off", "in", "a", "delay", "till", "the", "feast", "of", "Pentecost."], text: "And as Arthur sped before, so did he at Easter; yet there were some of the great lords had indignation that Arthur should be king, and put it off in a delay till the feast of Pentecost." },
+  { words: ["Then", "the", "Archbishop", "of", "Canterbury", "by", "Merlin’s", "providence", "let", "purvey", "then", "of", "the", "best", "knights", "that", "they", "might", "get,", "and", "such", "knights", "as", "Uther", "Pendragon", "loved", "best", "and", "most", "trusted", "in", "his", "days."], text: "Then the Archbishop of Canterbury by Merlin’s providence let purvey then of the best knights that they might get, and such knights as Uther Pendragon loved best and most trusted in his days." },
+  { words: ["And", "such", "knights", "were", "put", "about", "Arthur", "as", "Sir", "Baudwin", "of", "Britain,", "Sir", "Kay,", "Sir", "Ulfius,", "Sir", "Brastias."], text: "And such knights were put about Arthur as Sir Baudwin of Britain, Sir Kay, Sir Ulfius, Sir Brastias." },
+  { words: ["All", "these,", "with", "many", "other,", "were", "always", "about", "Arthur,", "day", "and", "night,", "till", "the", "feast", "of", "Pentecost."], text: "All these, with many other, were always about Arthur, day and night, till the feast of Pentecost." },
+  { words: ["CHAPTER", "VII.", "How", "King", "Arthur", "was", "crowned,", "and", "how", "he", "made", "officers."], text: "CHAPTER VII. How King Arthur was crowned, and how he made officers." },
+  { words: ["And", "at", "the", "feast", "of", "Pentecost", "all", "manner", "of", "men", "assayed", "to", "pull", "at", "the", "sword", "that", "would", "assay;", "but", "none", "might", "prevail", "but", "Arthur,", "and", "pulled", "it", "out", "afore", "all", "the", "lords", "and", "commons", "that", "were", "there,", "wherefore", "all", "the", "commons", "cried", "at", "once,", "We", "will", "have", "Arthur", "unto", "our", "king,", "we", "will", "put", "him", "no", "more", "in", "delay,", "for", "we", "all", "see", "that", "it", "is", "God’s", "will", "that", "he", "shall", "be", "our", "king,", "and", "who", "that", "holdeth", "against", "it,", "we", "will", "slay", "him."], text: "And at the feast of Pentecost all manner of men assayed to pull at the sword that would assay; but none might prevail but Arthur, and pulled it out afore all the lords and commons that were there, wherefore all the commons cried at once, We will have Arthur unto our king, we will put him no more in delay, for we all see that it is God’s will that he shall be our king, and who that holdeth against it, we will slay him." },
+  { words: ["And", "therewithal", "they", "kneeled", "at", "once,", "both", "rich", "and", "poor,", "and", "cried", "Arthur", "mercy", "because", "they", "had", "delayed", "him", "so", "long,", "and", "Arthur", "forgave", "them,", "and", "took", "the", "sword", "between", "both", "his", "hands,", "and", "offered", "it", "upon", "the", "altar", "where", "the", "Archbishop", "was,", "and", "so", "was", "he", "made", "knight", "of", "the", "best", "man", "that", "was", "there."], text: "And therewithal they kneeled at once, both rich and poor, and cried Arthur mercy because they had delayed him so long, and Arthur forgave them, and took the sword between both his hands, and offered it upon the altar where the Archbishop was, and so was he made knight of the best man that was there." },
+  { words: ["And", "so", "anon", "was", "the", "coronation", "made.", "And", "there", "was", "he", "sworn", "unto", "his", "lords", "and", "the", "commons", "for", "to", "be", "a", "true", "king,", "to"], text: "And so anon was the coronation made. And there was he sworn unto his lords and the commons for to be a true king, to" }
+];
 var scifiWords = [
   "FOREWORD",
   "To",
@@ -7004,22 +7616,16 @@ var scifiWords = [
   "can",
   "be",
   "opened",
-  "_only",
+  "only",
   "from",
   "the",
-  "inside_.",
+  "inside.",
   "Yours",
   "very",
   "sincerely,",
   "Edgar",
   "Rice",
   "Burroughs.",
-  "CHAPTER",
-  "I",
-  "ON",
-  "THE",
-  "ARIZONA",
-  "HILLS",
   "I",
   "am",
   "a",
@@ -9629,13 +10235,6 @@ var scifiWords = [
   "upon",
   "the",
   "floor.",
-  "CHAPTER",
-  "II",
-  "THE",
-  "ESCAPE",
-  "OF",
-  "THE",
-  "DEAD",
   "A",
   "sense",
   "of",
@@ -9809,6 +10408,127 @@ var scifiWords = [
   "the",
   "cliff"
 ];
+var scifiSentences = [
+  { words: ["FOREWORD", "To", "the", "Reader", "of", "this", "Work:", "In", "submitting", "Captain", "Carter’s", "strange", "manuscript", "to", "you", "in", "book", "form,", "I", "believe", "that", "a", "few", "words", "relative", "to", "this", "remarkable", "personality", "will", "be", "of", "interest."], text: "FOREWORD To the Reader of this Work: In submitting Captain Carter’s strange manuscript to you in book form, I believe that a few words relative to this remarkable personality will be of interest." },
+  { words: ["My", "first", "recollection", "of", "Captain", "Carter", "is", "of", "the", "few", "months", "he", "spent", "at", "my", "father’s", "home", "in", "Virginia,", "just", "prior", "to", "the", "opening", "of", "the", "civil", "war."], text: "My first recollection of Captain Carter is of the few months he spent at my father’s home in Virginia, just prior to the opening of the civil war." },
+  { words: ["I", "was", "then", "a", "child", "of", "but", "five", "years,", "yet", "I", "well", "remember", "the", "tall,", "dark,", "smooth-faced,", "athletic", "man", "whom", "I", "called", "Uncle", "Jack."], text: "I was then a child of but five years, yet I well remember the tall, dark, smooth-faced, athletic man whom I called Uncle Jack." },
+  { words: ["He", "seemed", "always", "to", "be", "laughing;", "and", "he", "entered", "into", "the", "sports", "of", "the", "children", "with", "the", "same", "hearty", "good", "fellowship", "he", "displayed", "toward", "those", "pastimes", "in", "which", "the", "men", "and", "women", "of", "his", "own", "age", "indulged;", "or", "he", "would", "sit", "for", "an", "hour", "at", "a", "time", "entertaining", "my", "old", "grandmother", "with", "stories", "of", "his", "strange,", "wild", "life", "in", "all", "parts", "of", "the", "world."], text: "He seemed always to be laughing; and he entered into the sports of the children with the same hearty good fellowship he displayed toward those pastimes in which the men and women of his own age indulged; or he would sit for an hour at a time entertaining my old grandmother with stories of his strange, wild life in all parts of the world." },
+  { words: ["We", "all", "loved", "him,", "and", "our", "slaves", "fairly", "worshipped", "the", "ground", "he", "trod."], text: "We all loved him, and our slaves fairly worshipped the ground he trod." },
+  { words: ["He", "was", "a", "splendid", "specimen", "of", "manhood,", "standing", "a", "good", "two", "inches", "over", "six", "feet,", "broad", "of", "shoulder", "and", "narrow", "of", "hip,", "with", "the", "carriage", "of", "the", "trained", "fighting", "man."], text: "He was a splendid specimen of manhood, standing a good two inches over six feet, broad of shoulder and narrow of hip, with the carriage of the trained fighting man." },
+  { words: ["His", "features", "were", "regular", "and", "clear", "cut,", "his", "hair", "black", "and", "closely", "cropped,", "while", "his", "eyes", "were", "of", "a", "steel", "gray,", "reflecting", "a", "strong", "and", "loyal", "character,", "filled", "with", "fire", "and", "initiative."], text: "His features were regular and clear cut, his hair black and closely cropped, while his eyes were of a steel gray, reflecting a strong and loyal character, filled with fire and initiative." },
+  { words: ["His", "manners", "were", "perfect,", "and", "his", "courtliness", "was", "that", "of", "a", "typical", "southern", "gentleman", "of", "the", "highest", "type."], text: "His manners were perfect, and his courtliness was that of a typical southern gentleman of the highest type." },
+  { words: ["His", "horsemanship,", "especially", "after", "hounds,", "was", "a", "marvel", "and", "delight", "even", "in", "that", "country", "of", "magnificent", "horsemen."], text: "His horsemanship, especially after hounds, was a marvel and delight even in that country of magnificent horsemen." },
+  { words: ["I", "have", "often", "heard", "my", "father", "caution", "him", "against", "his", "wild", "recklessness,", "but", "he", "would", "only", "laugh,", "and", "say", "that", "the", "tumble", "that", "killed", "him", "would", "be", "from", "the", "back", "of", "a", "horse", "yet", "unfoaled."], text: "I have often heard my father caution him against his wild recklessness, but he would only laugh, and say that the tumble that killed him would be from the back of a horse yet unfoaled." },
+  { words: ["When", "the", "war", "broke", "out", "he", "left", "us,", "nor", "did", "I", "see", "him", "again", "for", "some", "fifteen", "or", "sixteen", "years."], text: "When the war broke out he left us, nor did I see him again for some fifteen or sixteen years." },
+  { words: ["When", "he", "returned", "it", "was", "without", "warning,", "and", "I", "was", "much", "surprised", "to", "note", "that", "he", "had", "not", "aged", "apparently", "a", "moment,", "nor", "had", "he", "changed", "in", "any", "other", "outward", "way."], text: "When he returned it was without warning, and I was much surprised to note that he had not aged apparently a moment, nor had he changed in any other outward way." },
+  { words: ["He", "was,", "when", "others", "were", "with", "him,", "the", "same", "genial,", "happy", "fellow", "we", "had", "known", "of", "old,", "but", "when", "he", "thought", "himself", "alone", "I", "have", "seen", "him", "sit", "for", "hours", "gazing", "off", "into", "space,", "his", "face", "set", "in", "a", "look", "of", "wistful", "longing", "and", "hopeless", "misery;", "and", "at", "night", "he", "would", "sit", "thus", "looking", "up", "into", "the", "heavens,", "at", "what", "I", "did", "not", "know", "until", "I", "read", "his", "manuscript", "years", "afterward."], text: "He was, when others were with him, the same genial, happy fellow we had known of old, but when he thought himself alone I have seen him sit for hours gazing off into space, his face set in a look of wistful longing and hopeless misery; and at night he would sit thus looking up into the heavens, at what I did not know until I read his manuscript years afterward." },
+  { words: ["He", "told", "us", "that", "he", "had", "been", "prospecting", "and", "mining", "in", "Arizona", "part", "of", "the", "time", "since", "the", "war;", "and", "that", "he", "had", "been", "very", "successful", "was", "evidenced", "by", "the", "unlimited", "amount", "of", "money", "with", "which", "he", "was", "supplied."], text: "He told us that he had been prospecting and mining in Arizona part of the time since the war; and that he had been very successful was evidenced by the unlimited amount of money with which he was supplied." },
+  { words: ["As", "to", "the", "details", "of", "his", "life", "during", "these", "years", "he", "was", "very", "reticent,", "in", "fact", "he", "would", "not", "talk", "of", "them", "at", "all."], text: "As to the details of his life during these years he was very reticent, in fact he would not talk of them at all." },
+  { words: ["He", "remained", "with", "us", "for", "about", "a", "year", "and", "then", "went", "to", "New", "York,", "where", "he", "purchased", "a", "little", "place", "on", "the", "Hudson,", "where", "I", "visited", "him", "once", "a", "year", "on", "the", "occasions", "of", "my", "trips", "to", "the", "New", "York", "market—my", "father", "and", "I", "owning", "and", "operating", "a", "string", "of", "general", "stores", "throughout", "Virginia", "at", "that", "time."], text: "He remained with us for about a year and then went to New York, where he purchased a little place on the Hudson, where I visited him once a year on the occasions of my trips to the New York market—my father and I owning and operating a string of general stores throughout Virginia at that time." },
+  { words: ["Captain", "Carter", "had", "a", "small", "but", "beautiful", "cottage,", "situated", "on", "a", "bluff", "overlooking", "the", "river,", "and", "during", "one", "of", "my", "last", "visits,", "in", "the", "winter", "of", "1885,", "I", "observed", "he", "was", "much", "occupied", "in", "writing,", "I", "presume", "now,", "upon", "this", "manuscript."], text: "Captain Carter had a small but beautiful cottage, situated on a bluff overlooking the river, and during one of my last visits, in the winter of 1885, I observed he was much occupied in writing, I presume now, upon this manuscript." },
+  { words: ["He", "told", "me", "at", "this", "time", "that", "if", "anything", "should", "happen", "to", "him", "he", "wished", "me", "to", "take", "charge", "of", "his", "estate,", "and", "he", "gave", "me", "a", "key", "to", "a", "compartment", "in", "the", "safe", "which", "stood", "in", "his", "study,", "telling", "me", "I", "would", "find", "his", "will", "there", "and", "some", "personal", "instructions", "which", "he", "had", "me", "pledge", "myself", "to", "carry", "out", "with", "absolute", "fidelity."], text: "He told me at this time that if anything should happen to him he wished me to take charge of his estate, and he gave me a key to a compartment in the safe which stood in his study, telling me I would find his will there and some personal instructions which he had me pledge myself to carry out with absolute fidelity." },
+  { words: ["After", "I", "had", "retired", "for", "the", "night", "I", "have", "seen", "him", "from", "my", "window", "standing", "in", "the", "moonlight", "on", "the", "brink", "of", "the", "bluff", "overlooking", "the", "Hudson", "with", "his", "arms", "stretched", "out", "to", "the", "heavens", "as", "though", "in", "appeal."], text: "After I had retired for the night I have seen him from my window standing in the moonlight on the brink of the bluff overlooking the Hudson with his arms stretched out to the heavens as though in appeal." },
+  { words: ["I", "thought", "at", "the", "time", "that", "he", "was", "praying,", "although", "I", "never", "understood", "that", "he", "was", "in", "the", "strict", "sense", "of", "the", "term", "a", "religious", "man."], text: "I thought at the time that he was praying, although I never understood that he was in the strict sense of the term a religious man." },
+  { words: ["Several", "months", "after", "I", "had", "returned", "home", "from", "my", "last", "visit,", "the", "first", "of", "March,", "1886,", "I", "think,", "I", "received", "a", "telegram", "from", "him", "asking", "me", "to", "come", "to", "him", "at", "once."], text: "Several months after I had returned home from my last visit, the first of March, 1886, I think, I received a telegram from him asking me to come to him at once." },
+  { words: ["I", "had", "always", "been", "his", "favorite", "among", "the", "younger", "generation", "of", "Carters", "and", "so", "I", "hastened", "to", "comply", "with", "his", "demand."], text: "I had always been his favorite among the younger generation of Carters and so I hastened to comply with his demand." },
+  { words: ["I", "arrived", "at", "the", "little", "station,", "about", "a", "mile", "from", "his", "grounds,", "on", "the", "morning", "of", "March", "4,", "1886,", "and", "when", "I", "asked", "the", "livery", "man", "to", "drive", "me", "out", "to", "Captain", "Carter’s", "he", "replied", "that", "if", "I", "was", "a", "friend", "of", "the", "Captain’s", "he", "had", "some", "very", "bad", "news", "for", "me;", "the", "Captain", "had", "been", "found", "dead", "shortly", "after", "daylight", "that", "very", "morning", "by", "the", "watchman", "attached", "to", "an", "adjoining", "property."], text: "I arrived at the little station, about a mile from his grounds, on the morning of March 4, 1886, and when I asked the livery man to drive me out to Captain Carter’s he replied that if I was a friend of the Captain’s he had some very bad news for me; the Captain had been found dead shortly after daylight that very morning by the watchman attached to an adjoining property." },
+  { words: ["For", "some", "reason", "this", "news", "did", "not", "surprise", "me,", "but", "I", "hurried", "out", "to", "his", "place", "as", "quickly", "as", "possible,", "so", "that", "I", "could", "take", "charge", "of", "the", "body", "and", "of", "his", "affairs."], text: "For some reason this news did not surprise me, but I hurried out to his place as quickly as possible, so that I could take charge of the body and of his affairs." },
+  { words: ["I", "found", "the", "watchman", "who", "had", "discovered", "him,", "together", "with", "the", "local", "police", "chief", "and", "several", "townspeople,", "assembled", "in", "his", "little", "study."], text: "I found the watchman who had discovered him, together with the local police chief and several townspeople, assembled in his little study." },
+  { words: ["The", "watchman", "related", "the", "few", "details", "connected", "with", "the", "finding", "of", "the", "body,", "which", "he", "said", "had", "been", "still", "warm", "when", "he", "came", "upon", "it."], text: "The watchman related the few details connected with the finding of the body, which he said had been still warm when he came upon it." },
+  { words: ["It", "lay,", "he", "said,", "stretched", "full", "length", "in", "the", "snow", "with", "the", "arms", "outstretched", "above", "the", "head", "toward", "the", "edge", "of", "the", "bluff,", "and", "when", "he", "showed", "me", "the", "spot", "it", "flashed", "upon", "me", "that", "it", "was", "the", "identical", "one", "where", "I", "had", "seen", "him", "on", "those", "other", "nights,", "with", "his", "arms", "raised", "in", "supplication", "to", "the", "skies."], text: "It lay, he said, stretched full length in the snow with the arms outstretched above the head toward the edge of the bluff, and when he showed me the spot it flashed upon me that it was the identical one where I had seen him on those other nights, with his arms raised in supplication to the skies." },
+  { words: ["There", "were", "no", "marks", "of", "violence", "on", "the", "body,", "and", "with", "the", "aid", "of", "a", "local", "physician", "the", "coroner’s", "jury", "quickly", "reached", "a", "decision", "of", "death", "from", "heart", "failure."], text: "There were no marks of violence on the body, and with the aid of a local physician the coroner’s jury quickly reached a decision of death from heart failure." },
+  { words: ["Left", "alone", "in", "the", "study,", "I", "opened", "the", "safe", "and", "withdrew", "the", "contents", "of", "the", "drawer", "in", "which", "he", "had", "told", "me", "I", "would", "find", "my", "instructions."], text: "Left alone in the study, I opened the safe and withdrew the contents of the drawer in which he had told me I would find my instructions." },
+  { words: ["They", "were", "in", "part", "peculiar", "indeed,", "but", "I", "have", "followed", "them", "to", "each", "last", "detail", "as", "faithfully", "as", "I", "was", "able."], text: "They were in part peculiar indeed, but I have followed them to each last detail as faithfully as I was able." },
+  { words: ["He", "directed", "that", "I", "remove", "his", "body", "to", "Virginia", "without", "embalming,", "and", "that", "he", "be", "laid", "in", "an", "open", "coffin", "within", "a", "tomb", "which", "he", "previously", "had", "had", "constructed", "and", "which,", "as", "I", "later", "learned,", "was", "well", "ventilated."], text: "He directed that I remove his body to Virginia without embalming, and that he be laid in an open coffin within a tomb which he previously had had constructed and which, as I later learned, was well ventilated." },
+  { words: ["The", "instructions", "impressed", "upon", "me", "that", "I", "must", "personally", "see", "that", "this", "was", "carried", "out", "just", "as", "he", "directed,", "even", "in", "secrecy", "if", "necessary."], text: "The instructions impressed upon me that I must personally see that this was carried out just as he directed, even in secrecy if necessary." },
+  { words: ["His", "property", "was", "left", "in", "such", "a", "way", "that", "I", "was", "to", "receive", "the", "entire", "income", "for", "twenty-five", "years,", "when", "the", "principal", "was", "to", "become", "mine."], text: "His property was left in such a way that I was to receive the entire income for twenty-five years, when the principal was to become mine." },
+  { words: ["His", "further", "instructions", "related", "to", "this", "manuscript", "which", "I", "was", "to", "retain", "sealed", "and", "unread,", "just", "as", "I", "found", "it,", "for", "eleven", "years;", "nor", "was", "I", "to", "divulge", "its", "contents", "until", "twenty-one", "years", "after", "his", "death."], text: "His further instructions related to this manuscript which I was to retain sealed and unread, just as I found it, for eleven years; nor was I to divulge its contents until twenty-one years after his death." },
+  { words: ["A", "strange", "feature", "about", "the", "tomb,", "where", "his", "body", "still", "lies,", "is", "that", "the", "massive", "door", "is", "equipped", "with", "a", "single,", "huge", "gold-plated", "spring", "lock", "which", "can", "be", "opened", "only", "from", "the", "inside."], text: "A strange feature about the tomb, where his body still lies, is that the massive door is equipped with a single, huge gold-plated spring lock which can be opened only from the inside." },
+  { words: ["Yours", "very", "sincerely,", "Edgar", "Rice", "Burroughs."], text: "Yours very sincerely, Edgar Rice Burroughs." },
+  { words: ["I", "am", "a", "very", "old", "man;", "how", "old", "I", "do", "not", "know."], text: "I am a very old man; how old I do not know." },
+  { words: ["Possibly", "I", "am", "a", "hundred,", "possibly", "more;", "but", "I", "cannot", "tell", "because", "I", "have", "never", "aged", "as", "other", "men,", "nor", "do", "I", "remember", "any", "childhood."], text: "Possibly I am a hundred, possibly more; but I cannot tell because I have never aged as other men, nor do I remember any childhood." },
+  { words: ["So", "far", "as", "I", "can", "recollect", "I", "have", "always", "been", "a", "man,", "a", "man", "of", "about", "thirty."], text: "So far as I can recollect I have always been a man, a man of about thirty." },
+  { words: ["I", "appear", "today", "as", "I", "did", "forty", "years", "and", "more", "ago,", "and", "yet", "I", "feel", "that", "I", "cannot", "go", "on", "living", "forever;", "that", "some", "day", "I", "shall", "die", "the", "real", "death", "from", "which", "there", "is", "no", "resurrection."], text: "I appear today as I did forty years and more ago, and yet I feel that I cannot go on living forever; that some day I shall die the real death from which there is no resurrection." },
+  { words: ["I", "do", "not", "know", "why", "I", "should", "fear", "death,", "I", "who", "have", "died", "twice", "and", "am", "still", "alive;", "but", "yet", "I", "have", "the", "same", "horror", "of", "it", "as", "you", "who", "have", "never", "died,", "and", "it", "is", "because", "of", "this", "terror", "of", "death,", "I", "believe,", "that", "I", "am", "so", "convinced", "of", "my", "mortality."], text: "I do not know why I should fear death, I who have died twice and am still alive; but yet I have the same horror of it as you who have never died, and it is because of this terror of death, I believe, that I am so convinced of my mortality." },
+  { words: ["And", "because", "of", "this", "conviction", "I", "have", "determined", "to", "write", "down", "the", "story", "of", "the", "interesting", "periods", "of", "my", "life", "and", "of", "my", "death."], text: "And because of this conviction I have determined to write down the story of the interesting periods of my life and of my death." },
+  { words: ["I", "cannot", "explain", "the", "phenomena;", "I", "can", "only", "set", "down", "here", "in", "the", "words", "of", "an", "ordinary", "soldier", "of", "fortune", "a", "chronicle", "of", "the", "strange", "events", "that", "befell", "me", "during", "the", "ten", "years", "that", "my", "dead", "body", "lay", "undiscovered", "in", "an", "Arizona", "cave."], text: "I cannot explain the phenomena; I can only set down here in the words of an ordinary soldier of fortune a chronicle of the strange events that befell me during the ten years that my dead body lay undiscovered in an Arizona cave." },
+  { words: ["I", "have", "never", "told", "this", "story,", "nor", "shall", "mortal", "man", "see", "this", "manuscript", "until", "after", "I", "have", "passed", "over", "for", "eternity."], text: "I have never told this story, nor shall mortal man see this manuscript until after I have passed over for eternity." },
+  { words: ["I", "know", "that", "the", "average", "human", "mind", "will", "not", "believe", "what", "it", "cannot", "grasp,", "and", "so", "I", "do", "not", "purpose", "being", "pilloried", "by", "the", "public,", "the", "pulpit,", "and", "the", "press,", "and", "held", "up", "as", "a", "colossal", "liar", "when", "I", "am", "but", "telling", "the", "simple", "truths", "which", "some", "day", "science", "will", "substantiate."], text: "I know that the average human mind will not believe what it cannot grasp, and so I do not purpose being pilloried by the public, the pulpit, and the press, and held up as a colossal liar when I am but telling the simple truths which some day science will substantiate." },
+  { words: ["Possibly", "the", "suggestions", "which", "I", "gained", "upon", "Mars,", "and", "the", "knowledge", "which", "I", "can", "set", "down", "in", "this", "chronicle,", "will", "aid", "in", "an", "earlier", "understanding", "of", "the", "mysteries", "of", "our", "sister", "planet;", "mysteries", "to", "you,", "but", "no", "longer", "mysteries", "to", "me."], text: "Possibly the suggestions which I gained upon Mars, and the knowledge which I can set down in this chronicle, will aid in an earlier understanding of the mysteries of our sister planet; mysteries to you, but no longer mysteries to me." },
+  { words: ["My", "name", "is", "John", "Carter;", "I", "am", "better", "known", "as", "Captain", "Jack", "Carter", "of", "Virginia."], text: "My name is John Carter; I am better known as Captain Jack Carter of Virginia." },
+  { words: ["At", "the", "close", "of", "the", "Civil", "War", "I", "found", "myself", "possessed", "of", "several", "hundred", "thousand", "dollars", "(Confederate)", "and", "a", "captain’s", "commission", "in", "the", "cavalry", "arm", "of", "an", "army", "which", "no", "longer", "existed;", "the", "servant", "of", "a", "state", "which", "had", "vanished", "with", "the", "hopes", "of", "the", "South."], text: "At the close of the Civil War I found myself possessed of several hundred thousand dollars (Confederate) and a captain’s commission in the cavalry arm of an army which no longer existed; the servant of a state which had vanished with the hopes of the South." },
+  { words: ["Masterless,", "penniless,", "and", "with", "my", "only", "means", "of", "livelihood,", "fighting,", "gone,", "I", "determined", "to", "work", "my", "way", "to", "the", "southwest", "and", "attempt", "to", "retrieve", "my", "fallen", "fortunes", "in", "a", "search", "for", "gold."], text: "Masterless, penniless, and with my only means of livelihood, fighting, gone, I determined to work my way to the southwest and attempt to retrieve my fallen fortunes in a search for gold." },
+  { words: ["I", "spent", "nearly", "a", "year", "prospecting", "in", "company", "with", "another", "Confederate", "officer,", "Captain", "James", "K.", "Powell", "of", "Richmond."], text: "I spent nearly a year prospecting in company with another Confederate officer, Captain James K. Powell of Richmond." },
+  { words: ["We", "were", "extremely", "fortunate,", "for", "late", "in", "the", "winter", "of", "1865,", "after", "many", "hardships", "and", "privations,", "we", "located", "the", "most", "remarkable", "gold-bearing", "quartz", "vein", "that", "our", "wildest", "dreams", "had", "ever", "pictured."], text: "We were extremely fortunate, for late in the winter of 1865, after many hardships and privations, we located the most remarkable gold-bearing quartz vein that our wildest dreams had ever pictured." },
+  { words: ["Powell,", "who", "was", "a", "mining", "engineer", "by", "education,", "stated", "that", "we", "had", "uncovered", "over", "a", "million", "dollars", "worth", "of", "ore", "in", "a", "trifle", "over", "three", "months."], text: "Powell, who was a mining engineer by education, stated that we had uncovered over a million dollars worth of ore in a trifle over three months." },
+  { words: ["As", "our", "equipment", "was", "crude", "in", "the", "extreme", "we", "decided", "that", "one", "of", "us", "must", "return", "to", "civilization,", "purchase", "the", "necessary", "machinery", "and", "return", "with", "a", "sufficient", "force", "of", "men", "properly", "to", "work", "the", "mine."], text: "As our equipment was crude in the extreme we decided that one of us must return to civilization, purchase the necessary machinery and return with a sufficient force of men properly to work the mine." },
+  { words: ["As", "Powell", "was", "familiar", "with", "the", "country,", "as", "well", "as", "with", "the", "mechanical", "requirements", "of", "mining", "we", "determined", "that", "it", "would", "be", "best", "for", "him", "to", "make", "the", "trip."], text: "As Powell was familiar with the country, as well as with the mechanical requirements of mining we determined that it would be best for him to make the trip." },
+  { words: ["It", "was", "agreed", "that", "I", "was", "to", "hold", "down", "our", "claim", "against", "the", "remote", "possibility", "of", "its", "being", "jumped", "by", "some", "wandering", "prospector."], text: "It was agreed that I was to hold down our claim against the remote possibility of its being jumped by some wandering prospector." },
+  { words: ["On", "March", "3,", "1866,", "Powell", "and", "I", "packed", "his", "provisions", "on", "two", "of", "our", "burros,", "and", "bidding", "me", "good-bye", "he", "mounted", "his", "horse,", "and", "started", "down", "the", "mountainside", "toward", "the", "valley,", "across", "which", "led", "the", "first", "stage", "of", "his", "journey."], text: "On March 3, 1866, Powell and I packed his provisions on two of our burros, and bidding me good-bye he mounted his horse, and started down the mountainside toward the valley, across which led the first stage of his journey." },
+  { words: ["The", "morning", "of", "Powell’s", "departure", "was,", "like", "nearly", "all", "Arizona", "mornings,", "clear", "and", "beautiful;", "I", "could", "see", "him", "and", "his", "little", "pack", "animals", "picking", "their", "way", "down", "the", "mountainside", "toward", "the", "valley,", "and", "all", "during", "the", "morning", "I", "would", "catch", "occasional", "glimpses", "of", "them", "as", "they", "topped", "a", "hog", "back", "or", "came", "out", "upon", "a", "level", "plateau."], text: "The morning of Powell’s departure was, like nearly all Arizona mornings, clear and beautiful; I could see him and his little pack animals picking their way down the mountainside toward the valley, and all during the morning I would catch occasional glimpses of them as they topped a hog back or came out upon a level plateau." },
+  { words: ["My", "last", "sight", "of", "Powell", "was", "about", "three", "in", "the", "afternoon", "as", "he", "entered", "the", "shadows", "of", "the", "range", "on", "the", "opposite", "side", "of", "the", "valley."], text: "My last sight of Powell was about three in the afternoon as he entered the shadows of the range on the opposite side of the valley." },
+  { words: ["Some", "half", "hour", "later", "I", "happened", "to", "glance", "casually", "across", "the", "valley", "and", "was", "much", "surprised", "to", "note", "three", "little", "dots", "in", "about", "the", "same", "place", "I", "had", "last", "seen", "my", "friend", "and", "his", "two", "pack", "animals."], text: "Some half hour later I happened to glance casually across the valley and was much surprised to note three little dots in about the same place I had last seen my friend and his two pack animals." },
+  { words: ["I", "am", "not", "given", "to", "needless", "worrying,", "but", "the", "more", "I", "tried", "to", "convince", "myself", "that", "all", "was", "well", "with", "Powell,", "and", "that", "the", "dots", "I", "had", "seen", "on", "his", "trail", "were", "antelope", "or", "wild", "horses,", "the", "less", "I", "was", "able", "to", "assure", "myself."], text: "I am not given to needless worrying, but the more I tried to convince myself that all was well with Powell, and that the dots I had seen on his trail were antelope or wild horses, the less I was able to assure myself." },
+  { words: ["Since", "we", "had", "entered", "the", "territory", "we", "had", "not", "seen", "a", "hostile", "Indian,", "and", "we", "had,", "therefore,", "become", "careless", "in", "the", "extreme,", "and", "were", "wont", "to", "ridicule", "the", "stories", "we", "had", "heard", "of", "the", "great", "numbers", "of", "these", "vicious", "marauders", "that", "were", "supposed", "to", "haunt", "the", "trails,", "taking", "their", "toll", "in", "lives", "and", "torture", "of", "every", "white", "party", "which", "fell", "into", "their", "merciless", "clutches."], text: "Since we had entered the territory we had not seen a hostile Indian, and we had, therefore, become careless in the extreme, and were wont to ridicule the stories we had heard of the great numbers of these vicious marauders that were supposed to haunt the trails, taking their toll in lives and torture of every white party which fell into their merciless clutches." },
+  { words: ["Powell,", "I", "knew,", "was", "well", "armed", "and,", "further,", "an", "experienced", "Indian", "fighter;", "but", "I", "too", "had", "lived", "and", "fought", "for", "years", "among", "the", "Sioux", "in", "the", "North,", "and", "I", "knew", "that", "his", "chances", "were", "small", "against", "a", "party", "of", "cunning", "trailing", "Apaches."], text: "Powell, I knew, was well armed and, further, an experienced Indian fighter; but I too had lived and fought for years among the Sioux in the North, and I knew that his chances were small against a party of cunning trailing Apaches." },
+  { words: ["Finally", "I", "could", "endure", "the", "suspense", "no", "longer,", "and,", "arming", "myself", "with", "my", "two", "Colt", "revolvers", "and", "a", "carbine,", "I", "strapped", "two", "belts", "of", "cartridges", "about", "me", "and", "catching", "my", "saddle", "horse,", "started", "down", "the", "trail", "taken", "by", "Powell", "in", "the", "morning."], text: "Finally I could endure the suspense no longer, and, arming myself with my two Colt revolvers and a carbine, I strapped two belts of cartridges about me and catching my saddle horse, started down the trail taken by Powell in the morning." },
+  { words: ["As", "soon", "as", "I", "reached", "comparatively", "level", "ground", "I", "urged", "my", "mount", "into", "a", "canter", "and", "continued", "this,", "where", "the", "going", "permitted,", "until,", "close", "upon", "dusk,", "I", "discovered", "the", "point", "where", "other", "tracks", "joined", "those", "of", "Powell."], text: "As soon as I reached comparatively level ground I urged my mount into a canter and continued this, where the going permitted, until, close upon dusk, I discovered the point where other tracks joined those of Powell." },
+  { words: ["They", "were", "the", "tracks", "of", "unshod", "ponies,", "three", "of", "them,", "and", "the", "ponies", "had", "been", "galloping."], text: "They were the tracks of unshod ponies, three of them, and the ponies had been galloping." },
+  { words: ["I", "followed", "rapidly", "until,", "darkness", "shutting", "down,", "I", "was", "forced", "to", "await", "the", "rising", "of", "the", "moon,", "and", "given", "an", "opportunity", "to", "speculate", "on", "the", "question", "of", "the", "wisdom", "of", "my", "chase."], text: "I followed rapidly until, darkness shutting down, I was forced to await the rising of the moon, and given an opportunity to speculate on the question of the wisdom of my chase." },
+  { words: ["Possibly", "I", "had", "conjured", "up", "impossible", "dangers,", "like", "some", "nervous", "old", "housewife,", "and", "when", "I", "should", "catch", "up", "with", "Powell", "would", "get", "a", "good", "laugh", "for", "my", "pains."], text: "Possibly I had conjured up impossible dangers, like some nervous old housewife, and when I should catch up with Powell would get a good laugh for my pains." },
+  { words: ["However,", "I", "am", "not", "prone", "to", "sensitiveness,", "and", "the", "following", "of", "a", "sense", "of", "duty,", "wherever", "it", "may", "lead,", "has", "always", "been", "a", "kind", "of", "fetich", "with", "me", "throughout", "my", "life;", "which", "may", "account", "for", "the", "honors", "bestowed", "upon", "me", "by", "three", "republics", "and", "the", "decorations", "and", "friendships", "of", "an", "old", "and", "powerful", "emperor", "and", "several", "lesser", "kings,", "in", "whose", "service", "my", "sword", "has", "been", "red", "many", "a", "time."], text: "However, I am not prone to sensitiveness, and the following of a sense of duty, wherever it may lead, has always been a kind of fetich with me throughout my life; which may account for the honors bestowed upon me by three republics and the decorations and friendships of an old and powerful emperor and several lesser kings, in whose service my sword has been red many a time." },
+  { words: ["About", "nine", "o’clock", "the", "moon", "was", "sufficiently", "bright", "for", "me", "to", "proceed", "on", "my", "way", "and", "I", "had", "no", "difficulty", "in", "following", "the", "trail", "at", "a", "fast", "walk,", "and", "in", "some", "places", "at", "a", "brisk", "trot", "until,", "about", "midnight,", "I", "reached", "the", "water", "hole", "where", "Powell", "had", "expected", "to", "camp."], text: "About nine o’clock the moon was sufficiently bright for me to proceed on my way and I had no difficulty in following the trail at a fast walk, and in some places at a brisk trot until, about midnight, I reached the water hole where Powell had expected to camp." },
+  { words: ["I", "came", "upon", "the", "spot", "unexpectedly,", "finding", "it", "entirely", "deserted,", "with", "no", "signs", "of", "having", "been", "recently", "occupied", "as", "a", "camp."], text: "I came upon the spot unexpectedly, finding it entirely deserted, with no signs of having been recently occupied as a camp." },
+  { words: ["I", "was", "interested", "to", "note", "that", "the", "tracks", "of", "the", "pursuing", "horsemen,", "for", "such", "I", "was", "now", "convinced", "they", "must", "be,", "continued", "after", "Powell", "with", "only", "a", "brief", "stop", "at", "the", "hole", "for", "water;", "and", "always", "at", "the", "same", "rate", "of", "speed", "as", "his."], text: "I was interested to note that the tracks of the pursuing horsemen, for such I was now convinced they must be, continued after Powell with only a brief stop at the hole for water; and always at the same rate of speed as his." },
+  { words: ["I", "was", "positive", "now", "that", "the", "trailers", "were", "Apaches", "and", "that", "they", "wished", "to", "capture", "Powell", "alive", "for", "the", "fiendish", "pleasure", "of", "the", "torture,", "so", "I", "urged", "my", "horse", "onward", "at", "a", "most", "dangerous", "pace,", "hoping", "against", "hope", "that", "I", "would", "catch", "up", "with", "the", "red", "rascals", "before", "they", "attacked", "him."], text: "I was positive now that the trailers were Apaches and that they wished to capture Powell alive for the fiendish pleasure of the torture, so I urged my horse onward at a most dangerous pace, hoping against hope that I would catch up with the red rascals before they attacked him." },
+  { words: ["Further", "speculation", "was", "suddenly", "cut", "short", "by", "the", "faint", "report", "of", "two", "shots", "far", "ahead", "of", "me."], text: "Further speculation was suddenly cut short by the faint report of two shots far ahead of me." },
+  { words: ["I", "knew", "that", "Powell", "would", "need", "me", "now", "if", "ever,", "and", "I", "instantly", "urged", "my", "horse", "to", "his", "topmost", "speed", "up", "the", "narrow", "and", "difficult", "mountain", "trail."], text: "I knew that Powell would need me now if ever, and I instantly urged my horse to his topmost speed up the narrow and difficult mountain trail." },
+  { words: ["I", "had", "forged", "ahead", "for", "perhaps", "a", "mile", "or", "more", "without", "hearing", "further", "sounds,", "when", "the", "trail", "suddenly", "debouched", "onto", "a", "small,", "open", "plateau", "near", "the", "summit", "of", "the", "pass."], text: "I had forged ahead for perhaps a mile or more without hearing further sounds, when the trail suddenly debouched onto a small, open plateau near the summit of the pass." },
+  { words: ["I", "had", "passed", "through", "a", "narrow,", "overhanging", "gorge", "just", "before", "entering", "suddenly", "upon", "this", "table", "land,", "and", "the", "sight", "which", "met", "my", "eyes", "filled", "me", "with", "consternation", "and", "dismay."], text: "I had passed through a narrow, overhanging gorge just before entering suddenly upon this table land, and the sight which met my eyes filled me with consternation and dismay." },
+  { words: ["The", "little", "stretch", "of", "level", "land", "was", "white", "with", "Indian", "tepees,", "and", "there", "were", "probably", "half", "a", "thousand", "red", "warriors", "clustered", "around", "some", "object", "near", "the", "center", "of", "the", "camp."], text: "The little stretch of level land was white with Indian tepees, and there were probably half a thousand red warriors clustered around some object near the center of the camp." },
+  { words: ["Their", "attention", "was", "so", "wholly", "riveted", "to", "this", "point", "of", "interest", "that", "they", "did", "not", "notice", "me,", "and", "I", "easily", "could", "have", "turned", "back", "into", "the", "dark", "recesses", "of", "the", "gorge", "and", "made", "my", "escape", "with", "perfect", "safety."], text: "Their attention was so wholly riveted to this point of interest that they did not notice me, and I easily could have turned back into the dark recesses of the gorge and made my escape with perfect safety." },
+  { words: ["The", "fact,", "however,", "that", "this", "thought", "did", "not", "occur", "to", "me", "until", "the", "following", "day", "removes", "any", "possible", "right", "to", "a", "claim", "to", "heroism", "to", "which", "the", "narration", "of", "this", "episode", "might", "possibly", "otherwise", "entitle", "me."], text: "The fact, however, that this thought did not occur to me until the following day removes any possible right to a claim to heroism to which the narration of this episode might possibly otherwise entitle me." },
+  { words: ["I", "do", "not", "believe", "that", "I", "am", "made", "of", "the", "stuff", "which", "constitutes", "heroes,", "because,", "in", "all", "of", "the", "hundreds", "of", "instances", "that", "my", "voluntary", "acts", "have", "placed", "me", "face", "to", "face", "with", "death,", "I", "cannot", "recall", "a", "single", "one", "where", "any", "alternative", "step", "to", "that", "I", "took", "occurred", "to", "me", "until", "many", "hours", "later."], text: "I do not believe that I am made of the stuff which constitutes heroes, because, in all of the hundreds of instances that my voluntary acts have placed me face to face with death, I cannot recall a single one where any alternative step to that I took occurred to me until many hours later." },
+  { words: ["My", "mind", "is", "evidently", "so", "constituted", "that", "I", "am", "subconsciously", "forced", "into", "the", "path", "of", "duty", "without", "recourse", "to", "tiresome", "mental", "processes."], text: "My mind is evidently so constituted that I am subconsciously forced into the path of duty without recourse to tiresome mental processes." },
+  { words: ["However", "that", "may", "be,", "I", "have", "never", "regretted", "that", "cowardice", "is", "not", "optional", "with", "me."], text: "However that may be, I have never regretted that cowardice is not optional with me." },
+  { words: ["In", "this", "instance", "I", "was,", "of", "course,", "positive", "that", "Powell", "was", "the", "center", "of", "attraction,", "but", "whether", "I", "thought", "or", "acted", "first", "I", "do", "not", "know,", "but", "within", "an", "instant", "from", "the", "moment", "the", "scene", "broke", "upon", "my", "view", "I", "had", "whipped", "out", "my", "revolvers", "and", "was", "charging", "down", "upon", "the", "entire", "army", "of", "warriors,", "shooting", "rapidly,", "and", "whooping", "at", "the", "top", "of", "my", "lungs."], text: "In this instance I was, of course, positive that Powell was the center of attraction, but whether I thought or acted first I do not know, but within an instant from the moment the scene broke upon my view I had whipped out my revolvers and was charging down upon the entire army of warriors, shooting rapidly, and whooping at the top of my lungs." },
+  { words: ["Singlehanded,", "I", "could", "not", "have", "pursued", "better", "tactics,", "for", "the", "red", "men,", "convinced", "by", "sudden", "surprise", "that", "not", "less", "than", "a", "regiment", "of", "regulars", "was", "upon", "them,", "turned", "and", "fled", "in", "every", "direction", "for", "their", "bows,", "arrows,", "and", "rifles."], text: "Singlehanded, I could not have pursued better tactics, for the red men, convinced by sudden surprise that not less than a regiment of regulars was upon them, turned and fled in every direction for their bows, arrows, and rifles." },
+  { words: ["The", "view", "which", "their", "hurried", "routing", "disclosed", "filled", "me", "with", "apprehension", "and", "with", "rage."], text: "The view which their hurried routing disclosed filled me with apprehension and with rage." },
+  { words: ["Under", "the", "clear", "rays", "of", "the", "Arizona", "moon", "lay", "Powell,", "his", "body", "fairly", "bristling", "with", "the", "hostile", "arrows", "of", "the", "braves."], text: "Under the clear rays of the Arizona moon lay Powell, his body fairly bristling with the hostile arrows of the braves." },
+  { words: ["That", "he", "was", "already", "dead", "I", "could", "not", "but", "be", "convinced,", "and", "yet", "I", "would", "have", "saved", "his", "body", "from", "mutilation", "at", "the", "hands", "of", "the", "Apaches", "as", "quickly", "as", "I", "would", "have", "saved", "the", "man", "himself", "from", "death."], text: "That he was already dead I could not but be convinced, and yet I would have saved his body from mutilation at the hands of the Apaches as quickly as I would have saved the man himself from death." },
+  { words: ["Riding", "close", "to", "him", "I", "reached", "down", "from", "the", "saddle,", "and", "grasping", "his", "cartridge", "belt", "drew", "him", "up", "across", "the", "withers", "of", "my", "mount."], text: "Riding close to him I reached down from the saddle, and grasping his cartridge belt drew him up across the withers of my mount." },
+  { words: ["A", "backward", "glance", "convinced", "me", "that", "to", "return", "by", "the", "way", "I", "had", "come", "would", "be", "more", "hazardous", "than", "to", "continue", "across", "the", "plateau,", "so,", "putting", "spurs", "to", "my", "poor", "beast,", "I", "made", "a", "dash", "for", "the", "opening", "to", "the", "pass", "which", "I", "could", "distinguish", "on", "the", "far", "side", "of", "the", "table", "land."], text: "A backward glance convinced me that to return by the way I had come would be more hazardous than to continue across the plateau, so, putting spurs to my poor beast, I made a dash for the opening to the pass which I could distinguish on the far side of the table land." },
+  { words: ["The", "Indians", "had", "by", "this", "time", "discovered", "that", "I", "was", "alone", "and", "I", "was", "pursued", "with", "imprecations,", "arrows,", "and", "rifle", "balls."], text: "The Indians had by this time discovered that I was alone and I was pursued with imprecations, arrows, and rifle balls." },
+  { words: ["The", "fact", "that", "it", "is", "difficult", "to", "aim", "anything", "but", "imprecations", "accurately", "by", "moonlight,", "that", "they", "were", "upset", "by", "the", "sudden", "and", "unexpected", "manner", "of", "my", "advent,", "and", "that", "I", "was", "a", "rather", "rapidly", "moving", "target", "saved", "me", "from", "the", "various", "deadly", "projectiles", "of", "the", "enemy", "and", "permitted", "me", "to", "reach", "the", "shadows", "of", "the", "surrounding", "peaks", "before", "an", "orderly", "pursuit", "could", "be", "organized."], text: "The fact that it is difficult to aim anything but imprecations accurately by moonlight, that they were upset by the sudden and unexpected manner of my advent, and that I was a rather rapidly moving target saved me from the various deadly projectiles of the enemy and permitted me to reach the shadows of the surrounding peaks before an orderly pursuit could be organized." },
+  { words: ["My", "horse", "was", "traveling", "practically", "unguided", "as", "I", "knew", "that", "I", "had", "probably", "less", "knowledge", "of", "the", "exact", "location", "of", "the", "trail", "to", "the", "pass", "than", "he,", "and", "thus", "it", "happened", "that", "he", "entered", "a", "defile", "which", "led", "to", "the", "summit", "of", "the", "range", "and", "not", "to", "the", "pass", "which", "I", "had", "hoped", "would", "carry", "me", "to", "the", "valley", "and", "to", "safety."], text: "My horse was traveling practically unguided as I knew that I had probably less knowledge of the exact location of the trail to the pass than he, and thus it happened that he entered a defile which led to the summit of the range and not to the pass which I had hoped would carry me to the valley and to safety." },
+  { words: ["It", "is", "probable,", "however,", "that", "to", "this", "fact", "I", "owe", "my", "life", "and", "the", "remarkable", "experiences", "and", "adventures", "which", "befell", "me", "during", "the", "following", "ten", "years."], text: "It is probable, however, that to this fact I owe my life and the remarkable experiences and adventures which befell me during the following ten years." },
+  { words: ["My", "first", "knowledge", "that", "I", "was", "on", "the", "wrong", "trail", "came", "when", "I", "heard", "the", "yells", "of", "the", "pursuing", "savages", "suddenly", "grow", "fainter", "and", "fainter", "far", "off", "to", "my", "left."], text: "My first knowledge that I was on the wrong trail came when I heard the yells of the pursuing savages suddenly grow fainter and fainter far off to my left." },
+  { words: ["I", "knew", "then", "that", "they", "had", "passed", "to", "the", "left", "of", "the", "jagged", "rock", "formation", "at", "the", "edge", "of", "the", "plateau,", "to", "the", "right", "of", "which", "my", "horse", "had", "borne", "me", "and", "the", "body", "of", "Powell."], text: "I knew then that they had passed to the left of the jagged rock formation at the edge of the plateau, to the right of which my horse had borne me and the body of Powell." },
+  { words: ["I", "drew", "rein", "on", "a", "little", "level", "promontory", "overlooking", "the", "trail", "below", "and", "to", "my", "left,", "and", "saw", "the", "party", "of", "pursuing", "savages", "disappearing", "around", "the", "point", "of", "a", "neighboring", "peak."], text: "I drew rein on a little level promontory overlooking the trail below and to my left, and saw the party of pursuing savages disappearing around the point of a neighboring peak." },
+  { words: ["I", "knew", "the", "Indians", "would", "soon", "discover", "that", "they", "were", "on", "the", "wrong", "trail", "and", "that", "the", "search", "for", "me", "would", "be", "renewed", "in", "the", "right", "direction", "as", "soon", "as", "they", "located", "my", "tracks."], text: "I knew the Indians would soon discover that they were on the wrong trail and that the search for me would be renewed in the right direction as soon as they located my tracks." },
+  { words: ["I", "had", "gone", "but", "a", "short", "distance", "further", "when", "what", "seemed", "to", "be", "an", "excellent", "trail", "opened", "up", "around", "the", "face", "of", "a", "high", "cliff."], text: "I had gone but a short distance further when what seemed to be an excellent trail opened up around the face of a high cliff." },
+  { words: ["The", "trail", "was", "level", "and", "quite", "broad", "and", "led", "upward", "and", "in", "the", "general", "direction", "I", "wished", "to", "go."], text: "The trail was level and quite broad and led upward and in the general direction I wished to go." },
+  { words: ["The", "cliff", "arose", "for", "several", "hundred", "feet", "on", "my", "right,", "and", "on", "my", "left", "was", "an", "equal", "and", "nearly", "perpendicular", "drop", "to", "the", "bottom", "of", "a", "rocky", "ravine."], text: "The cliff arose for several hundred feet on my right, and on my left was an equal and nearly perpendicular drop to the bottom of a rocky ravine." },
+  { words: ["I", "had", "followed", "this", "trail", "for", "perhaps", "a", "hundred", "yards", "when", "a", "sharp", "turn", "to", "the", "right", "brought", "me", "to", "the", "mouth", "of", "a", "large", "cave."], text: "I had followed this trail for perhaps a hundred yards when a sharp turn to the right brought me to the mouth of a large cave." },
+  { words: ["The", "opening", "was", "about", "four", "feet", "in", "height", "and", "three", "to", "four", "feet", "wide,", "and", "at", "this", "opening", "the", "trail", "ended."], text: "The opening was about four feet in height and three to four feet wide, and at this opening the trail ended." },
+  { words: ["It", "was", "now", "morning,", "and,", "with", "the", "customary", "lack", "of", "dawn", "which", "is", "a", "startling", "characteristic", "of", "Arizona,", "it", "had", "become", "daylight", "almost", "without", "warning."], text: "It was now morning, and, with the customary lack of dawn which is a startling characteristic of Arizona, it had become daylight almost without warning." },
+  { words: ["Dismounting,", "I", "laid", "Powell", "upon", "the", "ground,", "but", "the", "most", "painstaking", "examination", "failed", "to", "reveal", "the", "faintest", "spark", "of", "life."], text: "Dismounting, I laid Powell upon the ground, but the most painstaking examination failed to reveal the faintest spark of life." },
+  { words: ["I", "forced", "water", "from", "my", "canteen", "between", "his", "dead", "lips,", "bathed", "his", "face", "and", "rubbed", "his", "hands,", "working", "over", "him", "continuously", "for", "the", "better", "part", "of", "an", "hour", "in", "the", "face", "of", "the", "fact", "that", "I", "knew", "him", "to", "be", "dead."], text: "I forced water from my canteen between his dead lips, bathed his face and rubbed his hands, working over him continuously for the better part of an hour in the face of the fact that I knew him to be dead." },
+  { words: ["I", "was", "very", "fond", "of", "Powell;", "he", "was", "thoroughly", "a", "man", "in", "every", "respect;", "a", "polished", "southern", "gentleman;", "a", "staunch", "and", "true", "friend;", "and", "it", "was", "with", "a", "feeling", "of", "the", "deepest", "grief", "that", "I", "finally", "gave", "up", "my", "crude", "endeavors", "at", "resuscitation."], text: "I was very fond of Powell; he was thoroughly a man in every respect; a polished southern gentleman; a staunch and true friend; and it was with a feeling of the deepest grief that I finally gave up my crude endeavors at resuscitation." },
+  { words: ["Leaving", "Powell’s", "body", "where", "it", "lay", "on", "the", "ledge", "I", "crept", "into", "the", "cave", "to", "reconnoiter."], text: "Leaving Powell’s body where it lay on the ledge I crept into the cave to reconnoiter." },
+  { words: ["I", "found", "a", "large", "chamber,", "possibly", "a", "hundred", "feet", "in", "diameter", "and", "thirty", "or", "forty", "feet", "in", "height;", "a", "smooth", "and", "well-worn", "floor,", "and", "many", "other", "evidences", "that", "the", "cave", "had,", "at", "some", "remote", "period,", "been", "inhabited."], text: "I found a large chamber, possibly a hundred feet in diameter and thirty or forty feet in height; a smooth and well-worn floor, and many other evidences that the cave had, at some remote period, been inhabited." },
+  { words: ["The", "back", "of", "the", "cave", "was", "so", "lost", "in", "dense", "shadow", "that", "I", "could", "not", "distinguish", "whether", "there", "were", "openings", "into", "other", "apartments", "or", "not."], text: "The back of the cave was so lost in dense shadow that I could not distinguish whether there were openings into other apartments or not." },
+  { words: ["As", "I", "was", "continuing", "my", "examination", "I", "commenced", "to", "feel", "a", "pleasant", "drowsiness", "creeping", "over", "me", "which", "I", "attributed", "to", "the", "fatigue", "of", "my", "long", "and", "strenuous", "ride,", "and", "the", "reaction", "from", "the", "excitement", "of", "the", "fight", "and", "the", "pursuit."], text: "As I was continuing my examination I commenced to feel a pleasant drowsiness creeping over me which I attributed to the fatigue of my long and strenuous ride, and the reaction from the excitement of the fight and the pursuit." },
+  { words: ["I", "felt", "comparatively", "safe", "in", "my", "present", "location", "as", "I", "knew", "that", "one", "man", "could", "defend", "the", "trail", "to", "the", "cave", "against", "an", "army."], text: "I felt comparatively safe in my present location as I knew that one man could defend the trail to the cave against an army." },
+  { words: ["I", "soon", "became", "so", "drowsy", "that", "I", "could", "scarcely", "resist", "the", "strong", "desire", "to", "throw", "myself", "on", "the", "floor", "of", "the", "cave", "for", "a", "few", "moments’", "rest,", "but", "I", "knew", "that", "this", "would", "never", "do,", "as", "it", "would", "mean", "certain", "death", "at", "the", "hands", "of", "my", "red", "friends,", "who", "might", "be", "upon", "me", "at", "any", "moment."], text: "I soon became so drowsy that I could scarcely resist the strong desire to throw myself on the floor of the cave for a few moments’ rest, but I knew that this would never do, as it would mean certain death at the hands of my red friends, who might be upon me at any moment." },
+  { words: ["With", "an", "effort", "I", "started", "toward", "the", "opening", "of", "the", "cave", "only", "to", "reel", "drunkenly", "against", "a", "side", "wall,", "and", "from", "there", "slip", "prone", "upon", "the", "floor."], text: "With an effort I started toward the opening of the cave only to reel drunkenly against a side wall, and from there slip prone upon the floor." },
+  { words: ["A", "sense", "of", "delicious", "dreaminess", "overcame", "me,", "my", "muscles", "relaxed,", "and", "I", "was", "on", "the", "point", "of", "giving", "way", "to", "my", "desire", "to", "sleep", "when", "the", "sound", "of", "approaching", "horses", "reached", "my", "ears."], text: "A sense of delicious dreaminess overcame me, my muscles relaxed, and I was on the point of giving way to my desire to sleep when the sound of approaching horses reached my ears." },
+  { words: ["I", "attempted", "to", "spring", "to", "my", "feet", "but", "was", "horrified", "to", "discover", "that", "my", "muscles", "refused", "to", "respond", "to", "my", "will."], text: "I attempted to spring to my feet but was horrified to discover that my muscles refused to respond to my will." },
+  { words: ["I", "was", "now", "thoroughly", "awake,", "but", "as", "unable", "to", "move", "a", "muscle", "as", "though", "turned", "to", "stone."], text: "I was now thoroughly awake, but as unable to move a muscle as though turned to stone." },
+  { words: ["It", "was", "then,", "for", "the", "first", "time,", "that", "I", "noticed", "a", "slight", "vapor", "filling", "the", "cave."], text: "It was then, for the first time, that I noticed a slight vapor filling the cave." },
+  { words: ["It", "was", "extremely", "tenuous", "and", "only", "noticeable", "against", "the", "opening", "which", "led", "to", "daylight."], text: "It was extremely tenuous and only noticeable against the opening which led to daylight." },
+  { words: ["There", "also", "came", "to", "my", "nostrils", "a", "faintly", "pungent", "odor,", "and", "I", "could", "only", "assume", "that", "I", "had", "been", "overcome", "by", "some", "poisonous", "gas,", "but", "why", "I", "should", "retain", "my", "mental", "faculties", "and", "yet", "be", "unable", "to", "move", "I", "could", "not", "fathom.", "I", "lay", "facing", "the", "opening", "of", "the", "cave", "and", "where", "I", "could", "see", "the", "short", "stretch", "of", "trail", "which", "lay", "between", "the", "cave", "and", "the", "turn", "of", "the", "cliff"], text: "There also came to my nostrils a faintly pungent odor, and I could only assume that I had been overcome by some poisonous gas, but why I should retain my mental faculties and yet be unable to move I could not fathom. I lay facing the opening of the cave and where I could see the short stretch of trail which lay between the cave and the turn of the cliff" }
+];
 var romanceWords = [
   "It",
   "is",
@@ -9947,7 +10667,7 @@ var romanceWords = [
   "his",
   "wife,",
   "impatiently.",
-  "“_You_",
+  "“You",
   "want",
   "to",
   "tell",
@@ -9968,11 +10688,11 @@ var romanceWords = [
   "see",
   "the",
   "place”",
-  "[_Copyright",
+  "[Copyright",
   "1894",
   "by",
   "George",
-  "Allen._]]",
+  "Allen.]]",
   "This",
   "was",
   "invitation",
@@ -10146,7 +10866,7 @@ var romanceWords = [
   "likely",
   "that",
   "he",
-  "_may_",
+  "may",
   "fall",
   "in",
   "love",
@@ -10216,7 +10936,7 @@ var romanceWords = [
   "me.",
   "I",
   "certainly",
-  "_have_",
+  "have",
   "had",
   "my",
   "share",
@@ -10338,7 +11058,7 @@ var romanceWords = [
   "be",
   "impossible",
   "for",
-  "_us_",
+  "us",
   "to",
   "visit",
   "him,",
@@ -10439,7 +11159,7 @@ var romanceWords = [
   "are",
   "always",
   "giving",
-  "_her_",
+  "her",
   "the",
   "preference.”",
   "“They",
@@ -10626,7 +11346,7 @@ var romanceWords = [
   "understand",
   "his",
   "character.",
-  "_Her_",
+  "Her",
   "mind",
   "was",
   "less",
@@ -10671,15 +11391,15 @@ var romanceWords = [
   "and",
   "news.",
   "[Illustration:",
-  "M^{r.}",
+  "M^",
   "&",
-  "M^{rs.}",
+  "M^",
   "Bennet",
-  "[_Copyright",
+  "[Copyright",
   "1894",
   "by",
   "George",
-  "Allen._]]",
+  "Allen.]]",
   "[Illustration:",
   "“I",
   "hope",
@@ -10688,13 +11408,11 @@ var romanceWords = [
   "will",
   "like",
   "it”",
-  "[_Copyright",
+  "[Copyright",
   "1894",
   "by",
   "George",
-  "Allen._]]",
-  "CHAPTER",
-  "II.",
+  "Allen.]]",
   "Mr.",
   "Bennet",
   "was",
@@ -10781,7 +11499,7 @@ var romanceWords = [
   "way",
   "to",
   "know",
-  "_what_",
+  "what",
   "Mr.",
   "Bingley",
   "likes,”",
@@ -10996,7 +11714,7 @@ var romanceWords = [
   "Mr.",
   "Bingley",
   "to",
-  "_her_.”",
+  "her.”",
   "“Impossible,",
   "Mr.",
   "Bennet,",
@@ -11042,7 +11760,7 @@ var romanceWords = [
   "fortnight.",
   "But",
   "if",
-  "_we_",
+  "we",
   "do",
   "not",
   "venture,",
@@ -11129,7 +11847,7 @@ var romanceWords = [
   "agree",
   "with",
   "you",
-  "_there_.",
+  "there.",
   "What",
   "say",
   "you,",
@@ -11191,7 +11909,7 @@ var romanceWords = [
   "sorry",
   "to",
   "hear",
-  "_that_;",
+  "that;",
   "but",
   "why",
   "did",
@@ -11433,7 +12151,7 @@ var romanceWords = [
   "love,",
   "though",
   "you",
-  "_are_",
+  "are",
   "the",
   "youngest,",
   "I",
@@ -11460,7 +12178,7 @@ var romanceWords = [
   "for",
   "though",
   "I",
-  "_am_",
+  "am",
   "the",
   "youngest,",
   "I’m",
@@ -11499,8 +12217,6 @@ var romanceWords = [
   "black",
   "horse”",
   "]",
-  "CHAPTER",
-  "III.",
   "Not",
   "all",
   "that",
@@ -11865,11 +12581,11 @@ var romanceWords = [
   "the",
   "Party",
   "entered”",
-  "[_Copyright",
+  "[Copyright",
   "1894",
   "by",
   "George",
-  "Allen._]]",
+  "Allen.]]",
   "being",
   "gone",
   "to",
@@ -12462,7 +13178,7 @@ var romanceWords = [
   "see,",
   "uncommonly",
   "pretty.”",
-  "“_You_",
+  "“You",
   "are",
   "dancing",
   "with",
@@ -12527,11 +13243,11 @@ var romanceWords = [
   "“She",
   "is",
   "tolerable”",
-  "[_Copyright",
+  "[Copyright",
   "1894",
   "by",
   "George",
-  "Allen._]]",
+  "Allen.]]",
   "“Which",
   "do",
   "you",
@@ -12566,7 +13282,7 @@ var romanceWords = [
   "enough",
   "to",
   "tempt",
-  "_me_;",
+  "me;",
   "and",
   "I",
   "am",
@@ -12895,7 +13611,7 @@ var romanceWords = [
   "Only",
   "think",
   "of",
-  "_that_,",
+  "that,",
   "my",
   "dear:",
   "he",
@@ -13012,7 +13728,7 @@ var romanceWords = [
   "Lizzy,",
   "and",
   "the",
-  "_Boulanger_----”",
+  "Boulanger----”",
   "“If",
   "he",
   "had",
@@ -13020,7 +13736,7 @@ var romanceWords = [
   "any",
   "compassion",
   "for",
-  "_me_,”",
+  "me,”",
   "cried",
   "her",
   "husband",
@@ -13153,7 +13869,7 @@ var romanceWords = [
   "by",
   "not",
   "suiting",
-  "_his_",
+  "his",
   "fancy;",
   "for",
   "he",
@@ -13218,8 +13934,6 @@ var romanceWords = [
   "detest",
   "the",
   "man.”",
-  "CHAPTER",
-  "IV.",
   "When",
   "Jane",
   "and",
@@ -13325,7 +14039,7 @@ var romanceWords = [
   "“Did",
   "not",
   "you?",
-  "_I_",
+  "I",
   "did",
   "for",
   "you.",
@@ -13340,11 +14054,11 @@ var romanceWords = [
   "Compliments",
   "always",
   "take",
-  "_you_",
+  "you",
   "by",
   "surprise,",
   "and",
-  "_me_",
+  "me",
   "never.",
   "What",
   "could",
@@ -13475,13 +14189,13 @@ var romanceWords = [
   "and",
   "it",
   "is",
-  "_that_",
+  "that",
   "which",
   "makes",
   "the",
   "wonder.",
   "With",
-  "_your_",
+  "your",
   "good",
   "sense,",
   "to",
@@ -13680,19 +14394,224 @@ var romanceWords = [
   "and",
   "conceited."
 ];
+var romanceSentences = [
+  { words: ["It", "is", "a", "truth", "universally", "acknowledged,", "that", "a", "single", "man", "in", "possession", "of", "a", "good", "fortune", "must", "be", "in", "want", "of", "a", "wife."], text: "It is a truth universally acknowledged, that a single man in possession of a good fortune must be in want of a wife." },
+  { words: ["However", "little", "known", "the", "feelings", "or", "views", "of", "such", "a", "man", "may", "be", "on", "his", "first", "entering", "a", "neighbourhood,", "this", "truth", "is", "so", "well", "fixed", "in", "the", "minds", "of", "the", "surrounding", "families,", "that", "he", "is", "considered", "as", "the", "rightful", "property", "of", "some", "one", "or", "other", "of", "their", "daughters."], text: "However little known the feelings or views of such a man may be on his first entering a neighbourhood, this truth is so well fixed in the minds of the surrounding families, that he is considered as the rightful property of some one or other of their daughters." },
+  { words: ["“My", "dear", "Mr.", "Bennet,”", "said", "his", "lady", "to", "him", "one", "day,", "“have", "you", "heard", "that", "Netherfield", "Park", "is", "let", "at", "last?”"], text: "“My dear Mr. Bennet,” said his lady to him one day, “have you heard that Netherfield Park is let at last?”" },
+  { words: ["Mr.", "Bennet", "replied", "that", "he", "had", "not."], text: "Mr. Bennet replied that he had not." },
+  { words: ["“But", "it", "is,”", "returned", "she;", "“for", "Mrs.", "Long", "has", "just", "been", "here,", "and", "she", "told", "me", "all", "about", "it.”"], text: "“But it is,” returned she; “for Mrs. Long has just been here, and she told me all about it.”" },
+  { words: ["Mr.", "Bennet", "made", "no", "answer."], text: "Mr. Bennet made no answer." },
+  { words: ["“Do", "not", "you", "want", "to", "know", "who", "has", "taken", "it?”", "cried", "his", "wife,", "impatiently."], text: "“Do not you want to know who has taken it?” cried his wife, impatiently." },
+  { words: ["“You", "want", "to", "tell", "me,", "and", "I", "have", "no", "objection", "to", "hearing", "it.”"], text: "“You want to tell me, and I have no objection to hearing it.”" },
+  { words: ["[Illustration:", "“He", "came", "down", "to", "see", "the", "place”", "[Copyright", "1894", "by", "George", "Allen.]]", "This", "was", "invitation", "enough."], text: "[Illustration: “He came down to see the place” [Copyright 1894 by George Allen.]] This was invitation enough." },
+  { words: ["“Why,", "my", "dear,", "you", "must", "know,", "Mrs.", "Long", "says", "that", "Netherfield", "is", "taken", "by", "a", "young", "man", "of", "large", "fortune", "from", "the", "north", "of", "England;", "that", "he", "came", "down", "on", "Monday", "in", "a", "chaise", "and", "four", "to", "see", "the", "place,", "and", "was", "so", "much", "delighted", "with", "it", "that", "he", "agreed", "with", "Mr.", "Morris", "immediately;", "that", "he", "is", "to", "take", "possession", "before", "Michaelmas,", "and", "some", "of", "his", "servants", "are", "to", "be", "in", "the", "house", "by", "the", "end", "of", "next", "week.”"], text: "“Why, my dear, you must know, Mrs. Long says that Netherfield is taken by a young man of large fortune from the north of England; that he came down on Monday in a chaise and four to see the place, and was so much delighted with it that he agreed with Mr. Morris immediately; that he is to take possession before Michaelmas, and some of his servants are to be in the house by the end of next week.”" },
+  { words: ["“What", "is", "his", "name?”"], text: "“What is his name?”" },
+  { words: ["“Bingley.”", "“Is", "he", "married", "or", "single?”"], text: "“Bingley.” “Is he married or single?”" },
+  { words: ["“Oh,", "single,", "my", "dear,", "to", "be", "sure!"], text: "“Oh, single, my dear, to be sure!" },
+  { words: ["A", "single", "man", "of", "large", "fortune;", "four", "or", "five", "thousand", "a", "year."], text: "A single man of large fortune; four or five thousand a year." },
+  { words: ["What", "a", "fine", "thing", "for", "our", "girls!”"], text: "What a fine thing for our girls!”" },
+  { words: ["“How", "so?", "how", "can", "it", "affect", "them?”"], text: "“How so? how can it affect them?”" },
+  { words: ["“My", "dear", "Mr.", "Bennet,”", "replied", "his", "wife,", "“how", "can", "you", "be", "so", "tiresome?"], text: "“My dear Mr. Bennet,” replied his wife, “how can you be so tiresome?" },
+  { words: ["You", "must", "know", "that", "I", "am", "thinking", "of", "his", "marrying", "one", "of", "them.”"], text: "You must know that I am thinking of his marrying one of them.”" },
+  { words: ["“Is", "that", "his", "design", "in", "settling", "here?”"], text: "“Is that his design in settling here?”" },
+  { words: ["“Design?", "Nonsense,", "how", "can", "you", "talk", "so!"], text: "“Design? Nonsense, how can you talk so!" },
+  { words: ["But", "it", "is", "very", "likely", "that", "he", "may", "fall", "in", "love", "with", "one", "of", "them,", "and", "therefore", "you", "must", "visit", "him", "as", "soon", "as", "he", "comes.”"], text: "But it is very likely that he may fall in love with one of them, and therefore you must visit him as soon as he comes.”" },
+  { words: ["“I", "see", "no", "occasion", "for", "that."], text: "“I see no occasion for that." },
+  { words: ["You", "and", "the", "girls", "may", "go--or", "you", "may", "send", "them", "by", "themselves,", "which", "perhaps", "will", "be", "still", "better;", "for", "as", "you", "are", "as", "handsome", "as", "any", "of", "them,", "Mr.", "Bingley", "might", "like", "you", "the", "best", "of", "the", "party.”"], text: "You and the girls may go--or you may send them by themselves, which perhaps will be still better; for as you are as handsome as any of them, Mr. Bingley might like you the best of the party.”" },
+  { words: ["“My", "dear,", "you", "flatter", "me."], text: "“My dear, you flatter me." },
+  { words: ["I", "certainly", "have", "had", "my", "share", "of", "beauty,", "but", "I", "do", "not", "pretend", "to", "be", "anything", "extraordinary", "now."], text: "I certainly have had my share of beauty, but I do not pretend to be anything extraordinary now." },
+  { words: ["When", "a", "woman", "has", "five", "grown-up", "daughters,", "she", "ought", "to", "give", "over", "thinking", "of", "her", "own", "beauty.”"], text: "When a woman has five grown-up daughters, she ought to give over thinking of her own beauty.”" },
+  { words: ["“In", "such", "cases,", "a", "woman", "has", "not", "often", "much", "beauty", "to", "think", "of.”"], text: "“In such cases, a woman has not often much beauty to think of.”" },
+  { words: ["“But,", "my", "dear,", "you", "must", "indeed", "go", "and", "see", "Mr.", "Bingley", "when", "he", "comes", "into", "the", "neighbourhood.”"], text: "“But, my dear, you must indeed go and see Mr. Bingley when he comes into the neighbourhood.”" },
+  { words: ["“It", "is", "more", "than", "I", "engage", "for,", "I", "assure", "you.”"], text: "“It is more than I engage for, I assure you.”" },
+  { words: ["“But", "consider", "your", "daughters."], text: "“But consider your daughters." },
+  { words: ["Only", "think", "what", "an", "establishment", "it", "would", "be", "for", "one", "of", "them."], text: "Only think what an establishment it would be for one of them." },
+  { words: ["Sir", "William", "and", "Lady", "Lucas", "are", "determined", "to", "go,", "merely", "on", "that", "account;", "for", "in", "general,", "you", "know,", "they", "visit", "no", "new", "comers."], text: "Sir William and Lady Lucas are determined to go, merely on that account; for in general, you know, they visit no new comers." },
+  { words: ["Indeed", "you", "must", "go,", "for", "it", "will", "be", "impossible", "for", "us", "to", "visit", "him,", "if", "you", "do", "not.”"], text: "Indeed you must go, for it will be impossible for us to visit him, if you do not.”" },
+  { words: ["“You", "are", "over", "scrupulous,", "surely."], text: "“You are over scrupulous, surely." },
+  { words: ["I", "dare", "say", "Mr.", "Bingley", "will", "be", "very", "glad", "to", "see", "you;", "and", "I", "will", "send", "a", "few", "lines", "by", "you", "to", "assure", "him", "of", "my", "hearty", "consent", "to", "his", "marrying", "whichever", "he", "chooses", "of", "the", "girls--though", "I", "must", "throw", "in", "a", "good", "word", "for", "my", "little", "Lizzy.”"], text: "I dare say Mr. Bingley will be very glad to see you; and I will send a few lines by you to assure him of my hearty consent to his marrying whichever he chooses of the girls--though I must throw in a good word for my little Lizzy.”" },
+  { words: ["“I", "desire", "you", "will", "do", "no", "such", "thing."], text: "“I desire you will do no such thing." },
+  { words: ["Lizzy", "is", "not", "a", "bit", "better", "than", "the", "others:", "and", "I", "am", "sure", "she", "is", "not", "half", "so", "handsome", "as", "Jane,", "nor", "half", "so", "good-humoured", "as", "Lydia."], text: "Lizzy is not a bit better than the others: and I am sure she is not half so handsome as Jane, nor half so good-humoured as Lydia." },
+  { words: ["But", "you", "are", "always", "giving", "her", "the", "preference.”"], text: "But you are always giving her the preference.”" },
+  { words: ["“They", "have", "none", "of", "them", "much", "to", "recommend", "them,”", "replied", "he:", "“they", "are", "all", "silly", "and", "ignorant", "like", "other", "girls;", "but", "Lizzy", "has", "something", "more", "of", "quickness", "than", "her", "sisters.”"], text: "“They have none of them much to recommend them,” replied he: “they are all silly and ignorant like other girls; but Lizzy has something more of quickness than her sisters.”" },
+  { words: ["“Mr.", "Bennet,", "how", "can", "you", "abuse", "your", "own", "children", "in", "such", "a", "way?"], text: "“Mr. Bennet, how can you abuse your own children in such a way?" },
+  { words: ["You", "take", "delight", "in", "vexing", "me."], text: "You take delight in vexing me." },
+  { words: ["You", "have", "no", "compassion", "on", "my", "poor", "nerves.”"], text: "You have no compassion on my poor nerves.”" },
+  { words: ["“You", "mistake", "me,", "my", "dear."], text: "“You mistake me, my dear." },
+  { words: ["I", "have", "a", "high", "respect", "for", "your", "nerves."], text: "I have a high respect for your nerves." },
+  { words: ["They", "are", "my", "old", "friends."], text: "They are my old friends." },
+  { words: ["I", "have", "heard", "you", "mention", "them", "with", "consideration", "these", "twenty", "years", "at", "least.”"], text: "I have heard you mention them with consideration these twenty years at least.”" },
+  { words: ["“Ah,", "you", "do", "not", "know", "what", "I", "suffer.”"], text: "“Ah, you do not know what I suffer.”" },
+  { words: ["“But", "I", "hope", "you", "will", "get", "over", "it,", "and", "live", "to", "see", "many", "young", "men", "of", "four", "thousand", "a", "year", "come", "into", "the", "neighbourhood.”"], text: "“But I hope you will get over it, and live to see many young men of four thousand a year come into the neighbourhood.”" },
+  { words: ["“It", "will", "be", "no", "use", "to", "us,", "if", "twenty", "such", "should", "come,", "since", "you", "will", "not", "visit", "them.”"], text: "“It will be no use to us, if twenty such should come, since you will not visit them.”" },
+  { words: ["“Depend", "upon", "it,", "my", "dear,", "that", "when", "there", "are", "twenty,", "I", "will", "visit", "them", "all.”"], text: "“Depend upon it, my dear, that when there are twenty, I will visit them all.”" },
+  { words: ["Mr.", "Bennet", "was", "so", "odd", "a", "mixture", "of", "quick", "parts,", "sarcastic", "humour,", "reserve,", "and", "caprice,", "that", "the", "experience", "of", "three-and-twenty", "years", "had", "been", "insufficient", "to", "make", "his", "wife", "understand", "his", "character."], text: "Mr. Bennet was so odd a mixture of quick parts, sarcastic humour, reserve, and caprice, that the experience of three-and-twenty years had been insufficient to make his wife understand his character." },
+  { words: ["Her", "mind", "was", "less", "difficult", "to", "develope."], text: "Her mind was less difficult to develope." },
+  { words: ["She", "was", "a", "woman", "of", "mean", "understanding,", "little", "information,", "and", "uncertain", "temper."], text: "She was a woman of mean understanding, little information, and uncertain temper." },
+  { words: ["When", "she", "was", "discontented,", "she", "fancied", "herself", "nervous."], text: "When she was discontented, she fancied herself nervous." },
+  { words: ["The", "business", "of", "her", "life", "was", "to", "get", "her", "daughters", "married:", "its", "solace", "was", "visiting", "and", "news."], text: "The business of her life was to get her daughters married: its solace was visiting and news." },
+  { words: ["[Illustration:", "M^", "&", "M^", "Bennet", "[Copyright", "1894", "by", "George", "Allen.]]", "[Illustration:", "“I", "hope", "Mr.", "Bingley", "will", "like", "it”", "[Copyright", "1894", "by", "George", "Allen.]]", "Mr.", "Bennet", "was", "among", "the", "earliest", "of", "those", "who", "waited", "on", "Mr.", "Bingley."], text: "[Illustration: M^ & M^ Bennet [Copyright 1894 by George Allen.]] [Illustration: “I hope Mr. Bingley will like it” [Copyright 1894 by George Allen.]] Mr. Bennet was among the earliest of those who waited on Mr. Bingley." },
+  { words: ["He", "had", "always", "intended", "to", "visit", "him,", "though", "to", "the", "last", "always", "assuring", "his", "wife", "that", "he", "should", "not", "go;", "and", "till", "the", "evening", "after", "the", "visit", "was", "paid", "she", "had", "no", "knowledge", "of", "it."], text: "He had always intended to visit him, though to the last always assuring his wife that he should not go; and till the evening after the visit was paid she had no knowledge of it." },
+  { words: ["It", "was", "then", "disclosed", "in", "the", "following", "manner."], text: "It was then disclosed in the following manner." },
+  { words: ["Observing", "his", "second", "daughter", "employed", "in", "trimming", "a", "hat,", "he", "suddenly", "addressed", "her", "with,--", "“I", "hope", "Mr.", "Bingley", "will", "like", "it,", "Lizzy.”"], text: "Observing his second daughter employed in trimming a hat, he suddenly addressed her with,-- “I hope Mr. Bingley will like it, Lizzy.”" },
+  { words: ["“We", "are", "not", "in", "a", "way", "to", "know", "what", "Mr.", "Bingley", "likes,”", "said", "her", "mother,", "resentfully,", "“since", "we", "are", "not", "to", "visit.”"], text: "“We are not in a way to know what Mr. Bingley likes,” said her mother, resentfully, “since we are not to visit.”" },
+  { words: ["“But", "you", "forget,", "mamma,”", "said", "Elizabeth,", "“that", "we", "shall", "meet", "him", "at", "the", "assemblies,", "and", "that", "Mrs.", "Long", "has", "promised", "to", "introduce", "him.”"], text: "“But you forget, mamma,” said Elizabeth, “that we shall meet him at the assemblies, and that Mrs. Long has promised to introduce him.”" },
+  { words: ["“I", "do", "not", "believe", "Mrs.", "Long", "will", "do", "any", "such", "thing."], text: "“I do not believe Mrs. Long will do any such thing." },
+  { words: ["She", "has", "two", "nieces", "of", "her", "own."], text: "She has two nieces of her own." },
+  { words: ["She", "is", "a", "selfish,", "hypocritical", "woman,", "and", "I", "have", "no", "opinion", "of", "her.”"], text: "She is a selfish, hypocritical woman, and I have no opinion of her.”" },
+  { words: ["“No", "more", "have", "I,”", "said", "Mr.", "Bennet;", "“and", "I", "am", "glad", "to", "find", "that", "you", "do", "not", "depend", "on", "her", "serving", "you.”"], text: "“No more have I,” said Mr. Bennet; “and I am glad to find that you do not depend on her serving you.”" },
+  { words: ["Mrs.", "Bennet", "deigned", "not", "to", "make", "any", "reply;", "but,", "unable", "to", "contain", "herself,", "began", "scolding", "one", "of", "her", "daughters."], text: "Mrs. Bennet deigned not to make any reply; but, unable to contain herself, began scolding one of her daughters." },
+  { words: ["“Don’t", "keep", "coughing", "so,", "Kitty,", "for", "heaven’s", "sake!"], text: "“Don’t keep coughing so, Kitty, for heaven’s sake!" },
+  { words: ["Have", "a", "little", "compassion", "on", "my", "nerves."], text: "Have a little compassion on my nerves." },
+  { words: ["You", "tear", "them", "to", "pieces.”"], text: "You tear them to pieces.”" },
+  { words: ["“Kitty", "has", "no", "discretion", "in", "her", "coughs,”", "said", "her", "father;", "“she", "times", "them", "ill.”"], text: "“Kitty has no discretion in her coughs,” said her father; “she times them ill.”" },
+  { words: ["“I", "do", "not", "cough", "for", "my", "own", "amusement,”", "replied", "Kitty,", "fretfully."], text: "“I do not cough for my own amusement,” replied Kitty, fretfully." },
+  { words: ["“When", "is", "your", "next", "ball", "to", "be,", "Lizzy?”"], text: "“When is your next ball to be, Lizzy?”" },
+  { words: ["“To-morrow", "fortnight.”", "“Ay,", "so", "it", "is,”", "cried", "her", "mother,", "“and", "Mrs.", "Long", "does", "not", "come", "back", "till", "the", "day", "before;", "so,", "it", "will", "be", "impossible", "for", "her", "to", "introduce", "him,", "for", "she", "will", "not", "know", "him", "herself.”"], text: "“To-morrow fortnight.” “Ay, so it is,” cried her mother, “and Mrs. Long does not come back till the day before; so, it will be impossible for her to introduce him, for she will not know him herself.”" },
+  { words: ["“Then,", "my", "dear,", "you", "may", "have", "the", "advantage", "of", "your", "friend,", "and", "introduce", "Mr.", "Bingley", "to", "her.”"], text: "“Then, my dear, you may have the advantage of your friend, and introduce Mr. Bingley to her.”" },
+  { words: ["“Impossible,", "Mr.", "Bennet,", "impossible,", "when", "I", "am", "not", "acquainted", "with", "him", "myself;", "how", "can", "you", "be", "so", "teasing?”"], text: "“Impossible, Mr. Bennet, impossible, when I am not acquainted with him myself; how can you be so teasing?”" },
+  { words: ["“I", "honour", "your", "circumspection."], text: "“I honour your circumspection." },
+  { words: ["A", "fortnight’s", "acquaintance", "is", "certainly", "very", "little."], text: "A fortnight’s acquaintance is certainly very little." },
+  { words: ["One", "cannot", "know", "what", "a", "man", "really", "is", "by", "the", "end", "of", "a", "fortnight."], text: "One cannot know what a man really is by the end of a fortnight." },
+  { words: ["But", "if", "we", "do", "not", "venture,", "somebody", "else", "will;", "and", "after", "all,", "Mrs.", "Long", "and", "her", "nieces", "must", "stand", "their", "chance;", "and,", "therefore,", "as", "she", "will", "think", "it", "an", "act", "of", "kindness,", "if", "you", "decline", "the", "office,", "I", "will", "take", "it", "on", "myself.”"], text: "But if we do not venture, somebody else will; and after all, Mrs. Long and her nieces must stand their chance; and, therefore, as she will think it an act of kindness, if you decline the office, I will take it on myself.”" },
+  { words: ["The", "girls", "stared", "at", "their", "father."], text: "The girls stared at their father." },
+  { words: ["Mrs.", "Bennet", "said", "only,", "“Nonsense,", "nonsense!”"], text: "Mrs. Bennet said only, “Nonsense, nonsense!”" },
+  { words: ["“What", "can", "be", "the", "meaning", "of", "that", "emphatic", "exclamation?”", "cried", "he."], text: "“What can be the meaning of that emphatic exclamation?” cried he." },
+  { words: ["“Do", "you", "consider", "the", "forms", "of", "introduction,", "and", "the", "stress", "that", "is", "laid", "on", "them,", "as", "nonsense?"], text: "“Do you consider the forms of introduction, and the stress that is laid on them, as nonsense?" },
+  { words: ["I", "cannot", "quite", "agree", "with", "you", "there."], text: "I cannot quite agree with you there." },
+  { words: ["What", "say", "you,", "Mary?"], text: "What say you, Mary?" },
+  { words: ["For", "you", "are", "a", "young", "lady", "of", "deep", "reflection,", "I", "know,", "and", "read", "great", "books,", "and", "make", "extracts.”"], text: "For you are a young lady of deep reflection, I know, and read great books, and make extracts.”" },
+  { words: ["Mary", "wished", "to", "say", "something", "very", "sensible,", "but", "knew", "not", "how."], text: "Mary wished to say something very sensible, but knew not how." },
+  { words: ["“While", "Mary", "is", "adjusting", "her", "ideas,”", "he", "continued,", "“let", "us", "return", "to", "Mr.", "Bingley.”"], text: "“While Mary is adjusting her ideas,” he continued, “let us return to Mr. Bingley.”" },
+  { words: ["“I", "am", "sick", "of", "Mr.", "Bingley,”", "cried", "his", "wife."], text: "“I am sick of Mr. Bingley,” cried his wife." },
+  { words: ["“I", "am", "sorry", "to", "hear", "that;", "but", "why", "did", "you", "not", "tell", "me", "so", "before?"], text: "“I am sorry to hear that; but why did you not tell me so before?" },
+  { words: ["If", "I", "had", "known", "as", "much", "this", "morning,", "I", "certainly", "would", "not", "have", "called", "on", "him."], text: "If I had known as much this morning, I certainly would not have called on him." },
+  { words: ["It", "is", "very", "unlucky;", "but", "as", "I", "have", "actually", "paid", "the", "visit,", "we", "cannot", "escape", "the", "acquaintance", "now.”"], text: "It is very unlucky; but as I have actually paid the visit, we cannot escape the acquaintance now.”" },
+  { words: ["The", "astonishment", "of", "the", "ladies", "was", "just", "what", "he", "wished--that", "of", "Mrs.", "Bennet", "perhaps", "surpassing", "the", "rest;", "though", "when", "the", "first", "tumult", "of", "joy", "was", "over,", "she", "began", "to", "declare", "that", "it", "was", "what", "she", "had", "expected", "all", "the", "while."], text: "The astonishment of the ladies was just what he wished--that of Mrs. Bennet perhaps surpassing the rest; though when the first tumult of joy was over, she began to declare that it was what she had expected all the while." },
+  { words: ["“How", "good", "it", "was", "in", "you,", "my", "dear", "Mr.", "Bennet!"], text: "“How good it was in you, my dear Mr. Bennet!" },
+  { words: ["But", "I", "knew", "I", "should", "persuade", "you", "at", "last."], text: "But I knew I should persuade you at last." },
+  { words: ["I", "was", "sure", "you", "loved", "your", "girls", "too", "well", "to", "neglect", "such", "an", "acquaintance."], text: "I was sure you loved your girls too well to neglect such an acquaintance." },
+  { words: ["Well,", "how", "pleased", "I", "am!"], text: "Well, how pleased I am!" },
+  { words: ["And", "it", "is", "such", "a", "good", "joke,", "too,", "that", "you", "should", "have", "gone", "this", "morning,", "and", "never", "said", "a", "word", "about", "it", "till", "now.”"], text: "And it is such a good joke, too, that you should have gone this morning, and never said a word about it till now.”" },
+  { words: ["“Now,", "Kitty,", "you", "may", "cough", "as", "much", "as", "you", "choose,”", "said", "Mr.", "Bennet;", "and,", "as", "he", "spoke,", "he", "left", "the", "room,", "fatigued", "with", "the", "raptures", "of", "his", "wife."], text: "“Now, Kitty, you may cough as much as you choose,” said Mr. Bennet; and, as he spoke, he left the room, fatigued with the raptures of his wife." },
+  { words: ["“What", "an", "excellent", "father", "you", "have,", "girls,”", "said", "she,", "when", "the", "door", "was", "shut."], text: "“What an excellent father you have, girls,” said she, when the door was shut." },
+  { words: ["“I", "do", "not", "know", "how", "you", "will", "ever", "make", "him", "amends", "for", "his", "kindness;", "or", "me", "either,", "for", "that", "matter."], text: "“I do not know how you will ever make him amends for his kindness; or me either, for that matter." },
+  { words: ["At", "our", "time", "of", "life,", "it", "is", "not", "so", "pleasant,", "I", "can", "tell", "you,", "to", "be", "making", "new", "acquaintances", "every", "day;", "but", "for", "your", "sakes", "we", "would", "do", "anything."], text: "At our time of life, it is not so pleasant, I can tell you, to be making new acquaintances every day; but for your sakes we would do anything." },
+  { words: ["Lydia,", "my", "love,", "though", "you", "are", "the", "youngest,", "I", "dare", "say", "Mr.", "Bingley", "will", "dance", "with", "you", "at", "the", "next", "ball.”"], text: "Lydia, my love, though you are the youngest, I dare say Mr. Bingley will dance with you at the next ball.”" },
+  { words: ["“Oh,”", "said", "Lydia,", "stoutly,", "“I", "am", "not", "afraid;", "for", "though", "I", "am", "the", "youngest,", "I’m", "the", "tallest.”"], text: "“Oh,” said Lydia, stoutly, “I am not afraid; for though I am the youngest, I’m the tallest.”" },
+  { words: ["The", "rest", "of", "the", "evening", "was", "spent", "in", "conjecturing", "how", "soon", "he", "would", "return", "Mr.", "Bennet’s", "visit,", "and", "determining", "when", "they", "should", "ask", "him", "to", "dinner."], text: "The rest of the evening was spent in conjecturing how soon he would return Mr. Bennet’s visit, and determining when they should ask him to dinner." },
+  { words: ["[Illustration:", "“He", "rode", "a", "black", "horse”", "]", "Not", "all", "that", "Mrs.", "Bennet,", "however,", "with", "the", "assistance", "of", "her", "five", "daughters,", "could", "ask", "on", "the", "subject,", "was", "sufficient", "to", "draw", "from", "her", "husband", "any", "satisfactory", "description", "of", "Mr.", "Bingley."], text: "[Illustration: “He rode a black horse” ] Not all that Mrs. Bennet, however, with the assistance of her five daughters, could ask on the subject, was sufficient to draw from her husband any satisfactory description of Mr. Bingley." },
+  { words: ["They", "attacked", "him", "in", "various", "ways,", "with", "barefaced", "questions,", "ingenious", "suppositions,", "and", "distant", "surmises;", "but", "he", "eluded", "the", "skill", "of", "them", "all;", "and", "they", "were", "at", "last", "obliged", "to", "accept", "the", "second-hand", "intelligence", "of", "their", "neighbour,", "Lady", "Lucas."], text: "They attacked him in various ways, with barefaced questions, ingenious suppositions, and distant surmises; but he eluded the skill of them all; and they were at last obliged to accept the second-hand intelligence of their neighbour, Lady Lucas." },
+  { words: ["Her", "report", "was", "highly", "favourable."], text: "Her report was highly favourable." },
+  { words: ["Sir", "William", "had", "been", "delighted", "with", "him."], text: "Sir William had been delighted with him." },
+  { words: ["He", "was", "quite", "young,", "wonderfully", "handsome,", "extremely", "agreeable,", "and,", "to", "crown", "the", "whole,", "he", "meant", "to", "be", "at", "the", "next", "assembly", "with", "a", "large", "party."], text: "He was quite young, wonderfully handsome, extremely agreeable, and, to crown the whole, he meant to be at the next assembly with a large party." },
+  { words: ["Nothing", "could", "be", "more", "delightful!"], text: "Nothing could be more delightful!" },
+  { words: ["To", "be", "fond", "of", "dancing", "was", "a", "certain", "step", "towards", "falling", "in", "love;", "and", "very", "lively", "hopes", "of", "Mr.", "Bingley’s", "heart", "were", "entertained."], text: "To be fond of dancing was a certain step towards falling in love; and very lively hopes of Mr. Bingley’s heart were entertained." },
+  { words: ["“If", "I", "can", "but", "see", "one", "of", "my", "daughters", "happily", "settled", "at", "Netherfield,”", "said", "Mrs.", "Bennet", "to", "her", "husband,", "“and", "all", "the", "others", "equally", "well", "married,", "I", "shall", "have", "nothing", "to", "wish", "for.”"], text: "“If I can but see one of my daughters happily settled at Netherfield,” said Mrs. Bennet to her husband, “and all the others equally well married, I shall have nothing to wish for.”" },
+  { words: ["In", "a", "few", "days", "Mr.", "Bingley", "returned", "Mr.", "Bennet’s", "visit,", "and", "sat", "about", "ten", "minutes", "with", "him", "in", "his", "library."], text: "In a few days Mr. Bingley returned Mr. Bennet’s visit, and sat about ten minutes with him in his library." },
+  { words: ["He", "had", "entertained", "hopes", "of", "being", "admitted", "to", "a", "sight", "of", "the", "young", "ladies,", "of", "whose", "beauty", "he", "had", "heard", "much;", "but", "he", "saw", "only", "the", "father."], text: "He had entertained hopes of being admitted to a sight of the young ladies, of whose beauty he had heard much; but he saw only the father." },
+  { words: ["The", "ladies", "were", "somewhat", "more", "fortunate,", "for", "they", "had", "the", "advantage", "of", "ascertaining,", "from", "an", "upper", "window,", "that", "he", "wore", "a", "blue", "coat", "and", "rode", "a", "black", "horse."], text: "The ladies were somewhat more fortunate, for they had the advantage of ascertaining, from an upper window, that he wore a blue coat and rode a black horse." },
+  { words: ["An", "invitation", "to", "dinner", "was", "soon", "afterwards", "despatched;", "and", "already", "had", "Mrs.", "Bennet", "planned", "the", "courses", "that", "were", "to", "do", "credit", "to", "her", "housekeeping,", "when", "an", "answer", "arrived", "which", "deferred", "it", "all."], text: "An invitation to dinner was soon afterwards despatched; and already had Mrs. Bennet planned the courses that were to do credit to her housekeeping, when an answer arrived which deferred it all." },
+  { words: ["Mr.", "Bingley", "was", "obliged", "to", "be", "in", "town", "the", "following", "day,", "and", "consequently", "unable", "to", "accept", "the", "honour", "of", "their", "invitation,", "etc.", "Mrs.", "Bennet", "was", "quite", "disconcerted."], text: "Mr. Bingley was obliged to be in town the following day, and consequently unable to accept the honour of their invitation, etc. Mrs. Bennet was quite disconcerted." },
+  { words: ["She", "could", "not", "imagine", "what", "business", "he", "could", "have", "in", "town", "so", "soon", "after", "his", "arrival", "in", "Hertfordshire;", "and", "she", "began", "to", "fear", "that", "he", "might", "always", "be", "flying", "about", "from", "one", "place", "to", "another,", "and", "never", "settled", "at", "Netherfield", "as", "he", "ought", "to", "be."], text: "She could not imagine what business he could have in town so soon after his arrival in Hertfordshire; and she began to fear that he might always be flying about from one place to another, and never settled at Netherfield as he ought to be." },
+  { words: ["Lady", "Lucas", "quieted", "her", "fears", "a", "little", "by", "starting", "the", "idea", "of", "his", "[Illustration:", "“When", "the", "Party", "entered”", "[Copyright", "1894", "by", "George", "Allen.]]", "being", "gone", "to", "London", "only", "to", "get", "a", "large", "party", "for", "the", "ball;", "and", "a", "report", "soon", "followed", "that", "Mr.", "Bingley", "was", "to", "bring", "twelve", "ladies", "and", "seven", "gentlemen", "with", "him", "to", "the", "assembly."], text: "Lady Lucas quieted her fears a little by starting the idea of his [Illustration: “When the Party entered” [Copyright 1894 by George Allen.]] being gone to London only to get a large party for the ball; and a report soon followed that Mr. Bingley was to bring twelve ladies and seven gentlemen with him to the assembly." },
+  { words: ["The", "girls", "grieved", "over", "such", "a", "number", "of", "ladies;", "but", "were", "comforted", "the", "day", "before", "the", "ball", "by", "hearing", "that,", "instead", "of", "twelve,", "he", "had", "brought", "only", "six", "with", "him", "from", "London,", "his", "five", "sisters", "and", "a", "cousin."], text: "The girls grieved over such a number of ladies; but were comforted the day before the ball by hearing that, instead of twelve, he had brought only six with him from London, his five sisters and a cousin." },
+  { words: ["And", "when", "the", "party", "entered", "the", "assembly-room,", "it", "consisted", "of", "only", "five", "altogether:", "Mr.", "Bingley,", "his", "two", "sisters,", "the", "husband", "of", "the", "eldest,", "and", "another", "young", "man."], text: "And when the party entered the assembly-room, it consisted of only five altogether: Mr. Bingley, his two sisters, the husband of the eldest, and another young man." },
+  { words: ["Mr.", "Bingley", "was", "good-looking", "and", "gentlemanlike:", "he", "had", "a", "pleasant", "countenance,", "and", "easy,", "unaffected", "manners."], text: "Mr. Bingley was good-looking and gentlemanlike: he had a pleasant countenance, and easy, unaffected manners." },
+  { words: ["His", "sisters", "were", "fine", "women,", "with", "an", "air", "of", "decided", "fashion."], text: "His sisters were fine women, with an air of decided fashion." },
+  { words: ["His", "brother-in-law,", "Mr.", "Hurst,", "merely", "looked", "the", "gentleman;", "but", "his", "friend", "Mr.", "Darcy", "soon", "drew", "the", "attention", "of", "the", "room", "by", "his", "fine,", "tall", "person,", "handsome", "features,", "noble", "mien,", "and", "the", "report,", "which", "was", "in", "general", "circulation", "within", "five", "minutes", "after", "his", "entrance,", "of", "his", "having", "ten", "thousand", "a", "year."], text: "His brother-in-law, Mr. Hurst, merely looked the gentleman; but his friend Mr. Darcy soon drew the attention of the room by his fine, tall person, handsome features, noble mien, and the report, which was in general circulation within five minutes after his entrance, of his having ten thousand a year." },
+  { words: ["The", "gentlemen", "pronounced", "him", "to", "be", "a", "fine", "figure", "of", "a", "man,", "the", "ladies", "declared", "he", "was", "much", "handsomer", "than", "Mr.", "Bingley,", "and", "he", "was", "looked", "at", "with", "great", "admiration", "for", "about", "half", "the", "evening,", "till", "his", "manners", "gave", "a", "disgust", "which", "turned", "the", "tide", "of", "his", "popularity;", "for", "he", "was", "discovered", "to", "be", "proud,", "to", "be", "above", "his", "company,", "and", "above", "being", "pleased;", "and", "not", "all", "his", "large", "estate", "in", "Derbyshire", "could", "save", "him", "from", "having", "a", "most", "forbidding,", "disagreeable", "countenance,", "and", "being", "unworthy", "to", "be", "compared", "with", "his", "friend."], text: "The gentlemen pronounced him to be a fine figure of a man, the ladies declared he was much handsomer than Mr. Bingley, and he was looked at with great admiration for about half the evening, till his manners gave a disgust which turned the tide of his popularity; for he was discovered to be proud, to be above his company, and above being pleased; and not all his large estate in Derbyshire could save him from having a most forbidding, disagreeable countenance, and being unworthy to be compared with his friend." },
+  { words: ["Mr.", "Bingley", "had", "soon", "made", "himself", "acquainted", "with", "all", "the", "principal", "people", "in", "the", "room:", "he", "was", "lively", "and", "unreserved,", "danced", "every", "dance,", "was", "angry", "that", "the", "ball", "closed", "so", "early,", "and", "talked", "of", "giving", "one", "himself", "at", "Netherfield."], text: "Mr. Bingley had soon made himself acquainted with all the principal people in the room: he was lively and unreserved, danced every dance, was angry that the ball closed so early, and talked of giving one himself at Netherfield." },
+  { words: ["Such", "amiable", "qualities", "must", "speak", "for", "themselves."], text: "Such amiable qualities must speak for themselves." },
+  { words: ["What", "a", "contrast", "between", "him", "and", "his", "friend!"], text: "What a contrast between him and his friend!" },
+  { words: ["Mr.", "Darcy", "danced", "only", "once", "with", "Mrs.", "Hurst", "and", "once", "with", "Miss", "Bingley,", "declined", "being", "introduced", "to", "any", "other", "lady,", "and", "spent", "the", "rest", "of", "the", "evening", "in", "walking", "about", "the", "room,", "speaking", "occasionally", "to", "one", "of", "his", "own", "party."], text: "Mr. Darcy danced only once with Mrs. Hurst and once with Miss Bingley, declined being introduced to any other lady, and spent the rest of the evening in walking about the room, speaking occasionally to one of his own party." },
+  { words: ["His", "character", "was", "decided."], text: "His character was decided." },
+  { words: ["He", "was", "the", "proudest,", "most", "disagreeable", "man", "in", "the", "world,", "and", "everybody", "hoped", "that", "he", "would", "never", "come", "there", "again."], text: "He was the proudest, most disagreeable man in the world, and everybody hoped that he would never come there again." },
+  { words: ["Amongst", "the", "most", "violent", "against", "him", "was", "Mrs.", "Bennet,", "whose", "dislike", "of", "his", "general", "behaviour", "was", "sharpened", "into", "particular", "resentment", "by", "his", "having", "slighted", "one", "of", "her", "daughters."], text: "Amongst the most violent against him was Mrs. Bennet, whose dislike of his general behaviour was sharpened into particular resentment by his having slighted one of her daughters." },
+  { words: ["Elizabeth", "Bennet", "had", "been", "obliged,", "by", "the", "scarcity", "of", "gentlemen,", "to", "sit", "down", "for", "two", "dances;", "and", "during", "part", "of", "that", "time,", "Mr.", "Darcy", "had", "been", "standing", "near", "enough", "for", "her", "to", "overhear", "a", "conversation", "between", "him", "and", "Mr.", "Bingley,", "who", "came", "from", "the", "dance", "for", "a", "few", "minutes", "to", "press", "his", "friend", "to", "join", "it."], text: "Elizabeth Bennet had been obliged, by the scarcity of gentlemen, to sit down for two dances; and during part of that time, Mr. Darcy had been standing near enough for her to overhear a conversation between him and Mr. Bingley, who came from the dance for a few minutes to press his friend to join it." },
+  { words: ["“Come,", "Darcy,”", "said", "he,", "“I", "must", "have", "you", "dance."], text: "“Come, Darcy,” said he, “I must have you dance." },
+  { words: ["I", "hate", "to", "see", "you", "standing", "about", "by", "yourself", "in", "this", "stupid", "manner."], text: "I hate to see you standing about by yourself in this stupid manner." },
+  { words: ["You", "had", "much", "better", "dance.”"], text: "You had much better dance.”" },
+  { words: ["“I", "certainly", "shall", "not."], text: "“I certainly shall not." },
+  { words: ["You", "know", "how", "I", "detest", "it,", "unless", "I", "am", "particularly", "acquainted", "with", "my", "partner."], text: "You know how I detest it, unless I am particularly acquainted with my partner." },
+  { words: ["At", "such", "an", "assembly", "as", "this,", "it", "would", "be", "insupportable."], text: "At such an assembly as this, it would be insupportable." },
+  { words: ["Your", "sisters", "are", "engaged,", "and", "there", "is", "not", "another", "woman", "in", "the", "room", "whom", "it", "would", "not", "be", "a", "punishment", "to", "me", "to", "stand", "up", "with.”"], text: "Your sisters are engaged, and there is not another woman in the room whom it would not be a punishment to me to stand up with.”" },
+  { words: ["“I", "would", "not", "be", "so", "fastidious", "as", "you", "are,”", "cried", "Bingley,", "“for", "a", "kingdom!"], text: "“I would not be so fastidious as you are,” cried Bingley, “for a kingdom!" },
+  { words: ["Upon", "my", "honour,", "I", "never", "met", "with", "so", "many", "pleasant", "girls", "in", "my", "life", "as", "I", "have", "this", "evening;", "and", "there", "are", "several", "of", "them,", "you", "see,", "uncommonly", "pretty.”"], text: "Upon my honour, I never met with so many pleasant girls in my life as I have this evening; and there are several of them, you see, uncommonly pretty.”" },
+  { words: ["“You", "are", "dancing", "with", "the", "only", "handsome", "girl", "in", "the", "room,”", "said", "Mr.", "Darcy,", "looking", "at", "the", "eldest", "Miss", "Bennet."], text: "“You are dancing with the only handsome girl in the room,” said Mr. Darcy, looking at the eldest Miss Bennet." },
+  { words: ["“Oh,", "she", "is", "the", "most", "beautiful", "creature", "I", "ever", "beheld!"], text: "“Oh, she is the most beautiful creature I ever beheld!" },
+  { words: ["But", "there", "is", "one", "of", "her", "sisters", "sitting", "down", "just", "behind", "you,", "who", "is", "very", "pretty,", "and", "I", "dare", "say", "very", "agreeable."], text: "But there is one of her sisters sitting down just behind you, who is very pretty, and I dare say very agreeable." },
+  { words: ["Do", "let", "me", "ask", "my", "partner", "to", "introduce", "you.”"], text: "Do let me ask my partner to introduce you.”" },
+  { words: ["[Illustration:", "“She", "is", "tolerable”", "[Copyright", "1894", "by", "George", "Allen.]]", "“Which", "do", "you", "mean?”", "and", "turning", "round,", "he", "looked", "for", "a", "moment", "at", "Elizabeth,", "till,", "catching", "her", "eye,", "he", "withdrew", "his", "own,", "and", "coldly", "said,", "“She", "is", "tolerable:", "but", "not", "handsome", "enough", "to", "tempt", "me;", "and", "I", "am", "in", "no", "humour", "at", "present", "to", "give", "consequence", "to", "young", "ladies", "who", "are", "slighted", "by", "other", "men."], text: "[Illustration: “She is tolerable” [Copyright 1894 by George Allen.]] “Which do you mean?” and turning round, he looked for a moment at Elizabeth, till, catching her eye, he withdrew his own, and coldly said, “She is tolerable: but not handsome enough to tempt me; and I am in no humour at present to give consequence to young ladies who are slighted by other men." },
+  { words: ["You", "had", "better", "return", "to", "your", "partner", "and", "enjoy", "her", "smiles,", "for", "you", "are", "wasting", "your", "time", "with", "me.”"], text: "You had better return to your partner and enjoy her smiles, for you are wasting your time with me.”" },
+  { words: ["Mr.", "Bingley", "followed", "his", "advice."], text: "Mr. Bingley followed his advice." },
+  { words: ["Mr.", "Darcy", "walked", "off;", "and", "Elizabeth", "remained", "with", "no", "very", "cordial", "feelings", "towards", "him."], text: "Mr. Darcy walked off; and Elizabeth remained with no very cordial feelings towards him." },
+  { words: ["She", "told", "the", "story,", "however,", "with", "great", "spirit", "among", "her", "friends;", "for", "she", "had", "a", "lively,", "playful", "disposition,", "which", "delighted", "in", "anything", "ridiculous."], text: "She told the story, however, with great spirit among her friends; for she had a lively, playful disposition, which delighted in anything ridiculous." },
+  { words: ["The", "evening", "altogether", "passed", "off", "pleasantly", "to", "the", "whole", "family."], text: "The evening altogether passed off pleasantly to the whole family." },
+  { words: ["Mrs.", "Bennet", "had", "seen", "her", "eldest", "daughter", "much", "admired", "by", "the", "Netherfield", "party."], text: "Mrs. Bennet had seen her eldest daughter much admired by the Netherfield party." },
+  { words: ["Mr.", "Bingley", "had", "danced", "with", "her", "twice,", "and", "she", "had", "been", "distinguished", "by", "his", "sisters."], text: "Mr. Bingley had danced with her twice, and she had been distinguished by his sisters." },
+  { words: ["Jane", "was", "as", "much", "gratified", "by", "this", "as", "her", "mother", "could", "be,", "though", "in", "a", "quieter", "way."], text: "Jane was as much gratified by this as her mother could be, though in a quieter way." },
+  { words: ["Elizabeth", "felt", "Jane’s", "pleasure."], text: "Elizabeth felt Jane’s pleasure." },
+  { words: ["Mary", "had", "heard", "herself", "mentioned", "to", "Miss", "Bingley", "as", "the", "most", "accomplished", "girl", "in", "the", "neighbourhood;", "and", "Catherine", "and", "Lydia", "had", "been", "fortunate", "enough", "to", "be", "never", "without", "partners,", "which", "was", "all", "that", "they", "had", "yet", "learnt", "to", "care", "for", "at", "a", "ball."], text: "Mary had heard herself mentioned to Miss Bingley as the most accomplished girl in the neighbourhood; and Catherine and Lydia had been fortunate enough to be never without partners, which was all that they had yet learnt to care for at a ball." },
+  { words: ["They", "returned,", "therefore,", "in", "good", "spirits", "to", "Longbourn,", "the", "village", "where", "they", "lived,", "and", "of", "which", "they", "were", "the", "principal", "inhabitants."], text: "They returned, therefore, in good spirits to Longbourn, the village where they lived, and of which they were the principal inhabitants." },
+  { words: ["They", "found", "Mr.", "Bennet", "still", "up."], text: "They found Mr. Bennet still up." },
+  { words: ["With", "a", "book,", "he", "was", "regardless", "of", "time;", "and", "on", "the", "present", "occasion", "he", "had", "a", "good", "deal", "of", "curiosity", "as", "to", "the", "event", "of", "an", "evening", "which", "had", "raised", "such", "splendid", "expectations."], text: "With a book, he was regardless of time; and on the present occasion he had a good deal of curiosity as to the event of an evening which had raised such splendid expectations." },
+  { words: ["He", "had", "rather", "hoped", "that", "all", "his", "wife’s", "views", "on", "the", "stranger", "would", "be", "disappointed;", "but", "he", "soon", "found", "that", "he", "had", "a", "very", "different", "story", "to", "hear."], text: "He had rather hoped that all his wife’s views on the stranger would be disappointed; but he soon found that he had a very different story to hear." },
+  { words: ["“Oh,", "my", "dear", "Mr.", "Bennet,”", "as", "she", "entered", "the", "room,", "“we", "have", "had", "a", "most", "delightful", "evening,", "a", "most", "excellent", "ball."], text: "“Oh, my dear Mr. Bennet,” as she entered the room, “we have had a most delightful evening, a most excellent ball." },
+  { words: ["I", "wish", "you", "had", "been", "there."], text: "I wish you had been there." },
+  { words: ["Jane", "was", "so", "admired,", "nothing", "could", "be", "like", "it."], text: "Jane was so admired, nothing could be like it." },
+  { words: ["Everybody", "said", "how", "well", "she", "looked;", "and", "Mr.", "Bingley", "thought", "her", "quite", "beautiful,", "and", "danced", "with", "her", "twice."], text: "Everybody said how well she looked; and Mr. Bingley thought her quite beautiful, and danced with her twice." },
+  { words: ["Only", "think", "of", "that,", "my", "dear:", "he", "actually", "danced", "with", "her", "twice;", "and", "she", "was", "the", "only", "creature", "in", "the", "room", "that", "he", "asked", "a", "second", "time."], text: "Only think of that, my dear: he actually danced with her twice; and she was the only creature in the room that he asked a second time." },
+  { words: ["First", "of", "all,", "he", "asked", "Miss", "Lucas."], text: "First of all, he asked Miss Lucas." },
+  { words: ["I", "was", "so", "vexed", "to", "see", "him", "stand", "up", "with", "her;", "but,", "however,", "he", "did", "not", "admire", "her", "at", "all;", "indeed,", "nobody", "can,", "you", "know;", "and", "he", "seemed", "quite", "struck", "with", "Jane", "as", "she", "was", "going", "down", "the", "dance."], text: "I was so vexed to see him stand up with her; but, however, he did not admire her at all; indeed, nobody can, you know; and he seemed quite struck with Jane as she was going down the dance." },
+  { words: ["So", "he", "inquired", "who", "she", "was,", "and", "got", "introduced,", "and", "asked", "her", "for", "the", "two", "next."], text: "So he inquired who she was, and got introduced, and asked her for the two next." },
+  { words: ["Then,", "the", "two", "third", "he", "danced", "with", "Miss", "King,", "and", "the", "two", "fourth", "with", "Maria", "Lucas,", "and", "the", "two", "fifth", "with", "Jane", "again,", "and", "the", "two", "sixth", "with", "Lizzy,", "and", "the", "Boulanger----”", "“If", "he", "had", "had", "any", "compassion", "for", "me,”", "cried", "her", "husband", "impatiently,", "“he", "would", "not", "have", "danced", "half", "so", "much!"], text: "Then, the two third he danced with Miss King, and the two fourth with Maria Lucas, and the two fifth with Jane again, and the two sixth with Lizzy, and the Boulanger----” “If he had had any compassion for me,” cried her husband impatiently, “he would not have danced half so much!" },
+  { words: ["For", "God’s", "sake,", "say", "no", "more", "of", "his", "partners."], text: "For God’s sake, say no more of his partners." },
+  { words: ["O", "that", "he", "had", "sprained", "his", "ancle", "in", "the", "first", "dance!”"], text: "O that he had sprained his ancle in the first dance!”" },
+  { words: ["“Oh,", "my", "dear,”", "continued", "Mrs.", "Bennet,", "“I", "am", "quite", "delighted", "with", "him."], text: "“Oh, my dear,” continued Mrs. Bennet, “I am quite delighted with him." },
+  { words: ["He", "is", "so", "excessively", "handsome!", "and", "his", "sisters", "are", "charming", "women."], text: "He is so excessively handsome! and his sisters are charming women." },
+  { words: ["I", "never", "in", "my", "life", "saw", "anything", "more", "elegant", "than", "their", "dresses."], text: "I never in my life saw anything more elegant than their dresses." },
+  { words: ["I", "dare", "say", "the", "lace", "upon", "Mrs.", "Hurst’s", "gown----”", "Here", "she", "was", "interrupted", "again."], text: "I dare say the lace upon Mrs. Hurst’s gown----” Here she was interrupted again." },
+  { words: ["Mr.", "Bennet", "protested", "against", "any", "description", "of", "finery."], text: "Mr. Bennet protested against any description of finery." },
+  { words: ["She", "was", "therefore", "obliged", "to", "seek", "another", "branch", "of", "the", "subject,", "and", "related,", "with", "much", "bitterness", "of", "spirit,", "and", "some", "exaggeration,", "the", "shocking", "rudeness", "of", "Mr.", "Darcy."], text: "She was therefore obliged to seek another branch of the subject, and related, with much bitterness of spirit, and some exaggeration, the shocking rudeness of Mr. Darcy." },
+  { words: ["“But", "I", "can", "assure", "you,”", "she", "added,", "“that", "Lizzy", "does", "not", "lose", "much", "by", "not", "suiting", "his", "fancy;", "for", "he", "is", "a", "most", "disagreeable,", "horrid", "man,", "not", "at", "all", "worth", "pleasing."], text: "“But I can assure you,” she added, “that Lizzy does not lose much by not suiting his fancy; for he is a most disagreeable, horrid man, not at all worth pleasing." },
+  { words: ["So", "high", "and", "so", "conceited,", "that", "there", "was", "no", "enduring", "him!"], text: "So high and so conceited, that there was no enduring him!" },
+  { words: ["He", "walked", "here,", "and", "he", "walked", "there,", "fancying", "himself", "so", "very", "great!"], text: "He walked here, and he walked there, fancying himself so very great!" },
+  { words: ["Not", "handsome", "enough", "to", "dance", "with!"], text: "Not handsome enough to dance with!" },
+  { words: ["I", "wish", "you", "had", "been", "there,", "my", "dear,", "to", "have", "given", "him", "one", "of", "your", "set-downs."], text: "I wish you had been there, my dear, to have given him one of your set-downs." },
+  { words: ["I", "quite", "detest", "the", "man.”"], text: "I quite detest the man.”" },
+  { words: ["When", "Jane", "and", "Elizabeth", "were", "alone,", "the", "former,", "who", "had", "been", "cautious", "in", "her", "praise", "of", "Mr.", "Bingley", "before,", "expressed", "to", "her", "sister", "how", "very", "much", "she", "admired", "him."], text: "When Jane and Elizabeth were alone, the former, who had been cautious in her praise of Mr. Bingley before, expressed to her sister how very much she admired him." },
+  { words: ["“He", "is", "just", "what", "a", "young-man", "ought", "to", "be,”", "said", "she,", "“sensible,", "good-humoured,", "lively;", "and", "I", "never", "saw", "such", "happy", "manners!", "so", "much", "ease,", "with", "such", "perfect", "good", "breeding!”"], text: "“He is just what a young-man ought to be,” said she, “sensible, good-humoured, lively; and I never saw such happy manners! so much ease, with such perfect good breeding!”" },
+  { words: ["“He", "is", "also", "handsome,”", "replied", "Elizabeth,", "“which", "a", "young", "man", "ought", "likewise", "to", "be", "if", "he", "possibly", "can."], text: "“He is also handsome,” replied Elizabeth, “which a young man ought likewise to be if he possibly can." },
+  { words: ["His", "character", "is", "thereby", "complete.”"], text: "His character is thereby complete.”" },
+  { words: ["“I", "was", "very", "much", "flattered", "by", "his", "asking", "me", "to", "dance", "a", "second", "time."], text: "“I was very much flattered by his asking me to dance a second time." },
+  { words: ["I", "did", "not", "expect", "such", "a", "compliment.”"], text: "I did not expect such a compliment.”" },
+  { words: ["“Did", "not", "you?"], text: "“Did not you?" },
+  { words: ["I", "did", "for", "you."], text: "I did for you." },
+  { words: ["But", "that", "is", "one", "great", "difference", "between", "us."], text: "But that is one great difference between us." },
+  { words: ["Compliments", "always", "take", "you", "by", "surprise,", "and", "me", "never."], text: "Compliments always take you by surprise, and me never." },
+  { words: ["What", "could", "be", "more", "natural", "than", "his", "asking", "you", "again?"], text: "What could be more natural than his asking you again?" },
+  { words: ["He", "could", "not", "help", "seeing", "that", "you", "were", "about", "five", "times", "as", "pretty", "as", "every", "other", "woman", "in", "the", "room."], text: "He could not help seeing that you were about five times as pretty as every other woman in the room." },
+  { words: ["No", "thanks", "to", "his", "gallantry", "for", "that."], text: "No thanks to his gallantry for that." },
+  { words: ["Well,", "he", "certainly", "is", "very", "agreeable,", "and", "I", "give", "you", "leave", "to", "like", "him."], text: "Well, he certainly is very agreeable, and I give you leave to like him." },
+  { words: ["You", "have", "liked", "many", "a", "stupider", "person.”"], text: "You have liked many a stupider person.”" },
+  { words: ["“Dear", "Lizzy!”", "“Oh,", "you", "are", "a", "great", "deal", "too", "apt,", "you", "know,", "to", "like", "people", "in", "general."], text: "“Dear Lizzy!” “Oh, you are a great deal too apt, you know, to like people in general." },
+  { words: ["You", "never", "see", "a", "fault", "in", "anybody."], text: "You never see a fault in anybody." },
+  { words: ["All", "the", "world", "are", "good", "and", "agreeable", "in", "your", "eyes."], text: "All the world are good and agreeable in your eyes." },
+  { words: ["I", "never", "heard", "you", "speak", "ill", "of", "a", "human", "being", "in", "my", "life.”"], text: "I never heard you speak ill of a human being in my life.”" },
+  { words: ["“I", "would", "wish", "not", "to", "be", "hasty", "in", "censuring", "anyone;", "but", "I", "always", "speak", "what", "I", "think.”"], text: "“I would wish not to be hasty in censuring anyone; but I always speak what I think.”" },
+  { words: ["“I", "know", "you", "do:", "and", "it", "is", "that", "which", "makes", "the", "wonder."], text: "“I know you do: and it is that which makes the wonder." },
+  { words: ["With", "your", "good", "sense,", "to", "be", "so", "honestly", "blind", "to", "the", "follies", "and", "nonsense", "of", "others!"], text: "With your good sense, to be so honestly blind to the follies and nonsense of others!" },
+  { words: ["Affectation", "of", "candour", "is", "common", "enough;", "one", "meets", "with", "it", "everywhere."], text: "Affectation of candour is common enough; one meets with it everywhere." },
+  { words: ["But", "to", "be", "candid", "without", "ostentation", "or", "design,--to", "take", "the", "good", "of", "everybody’s", "character", "and", "make", "it", "still", "better,", "and", "say", "nothing", "of", "the", "bad,--belongs", "to", "you", "alone."], text: "But to be candid without ostentation or design,--to take the good of everybody’s character and make it still better, and say nothing of the bad,--belongs to you alone." },
+  { words: ["And", "so,", "you", "like", "this", "man’s", "sisters,", "too,", "do", "you?"], text: "And so, you like this man’s sisters, too, do you?" },
+  { words: ["Their", "manners", "are", "not", "equal", "to", "his.”"], text: "Their manners are not equal to his.”" },
+  { words: ["“Certainly", "not,", "at", "first;", "but", "they", "are", "very", "pleasing", "women", "when", "you", "converse", "with", "them."], text: "“Certainly not, at first; but they are very pleasing women when you converse with them." },
+  { words: ["Miss", "Bingley", "is", "to", "live", "with", "her", "brother,", "and", "keep", "his", "house;", "and", "I", "am", "much", "mistaken", "if", "we", "shall", "not", "find", "a", "very", "charming", "neighbour", "in", "her.”"], text: "Miss Bingley is to live with her brother, and keep his house; and I am much mistaken if we shall not find a very charming neighbour in her.”" },
+  { words: ["Elizabeth", "listened", "in", "silence,", "but", "was", "not", "convinced:", "their", "behaviour", "at", "the", "assembly", "had", "not", "been", "calculated", "to", "please", "in", "general;", "and", "with", "more", "quickness", "of", "observation", "and", "less", "pliancy", "of", "temper", "than", "her", "sister,", "and", "with", "a", "judgment,", "too,", "unassailed", "by", "any", "attention", "to", "herself,", "she", "was", "very", "little", "disposed", "to", "approve", "them."], text: "Elizabeth listened in silence, but was not convinced: their behaviour at the assembly had not been calculated to please in general; and with more quickness of observation and less pliancy of temper than her sister, and with a judgment, too, unassailed by any attention to herself, she was very little disposed to approve them." },
+  { words: ["They", "were,", "in", "fact,", "very", "fine", "ladies;", "not", "deficient", "in", "good-humour", "when", "they", "were", "pleased,", "nor", "in", "the", "power", "of", "being", "agreeable", "where", "they", "chose", "it;", "but", "proud", "and", "conceited."], text: "They were, in fact, very fine ladies; not deficient in good-humour when they were pleased, nor in the power of being agreeable where they chose it; but proud and conceited." }
+];
 var fantasyWords = [
-  "I.",
-  "THE",
-  "LIFE",
-  "AND",
-  "DEATH",
-  "OF",
-  "SCYLD.",
-  "{The",
-  "famous",
-  "race",
-  "of",
-  "Spear-Danes.}",
   "Lo!",
   "the",
   "Spear-Danes'",
@@ -13714,30 +14633,6 @@ var fantasyWords = [
   "then",
   "their",
   "prowess-in-battle.",
-  "{Scyld,",
-  "their",
-  "mighty",
-  "king,",
-  "in",
-  "honor",
-  "of",
-  "whom",
-  "they",
-  "are",
-  "often",
-  "called",
-  "Scyldings.",
-  "He",
-  "is",
-  "the",
-  "great-grandfather",
-  "of",
-  "Hrothgar,",
-  "so",
-  "prominent",
-  "in",
-  "the",
-  "poem.}",
   "Oft",
   "Scyld",
   "the",
@@ -13746,7 +14641,6 @@ var fantasyWords = [
   "scathers",
   "in",
   "numbers",
-  "5",
   "From",
   "many",
   "a",
@@ -13787,7 +14681,6 @@ var fantasyWords = [
   "were",
   "compelled",
   "to",
-  "10",
   "Bow",
   "to",
   "his",
@@ -13804,29 +14697,6 @@ var fantasyWords = [
   "was",
   "borne",
   "him",
-  "{A",
-  "son",
-  "is",
-  "born",
-  "to",
-  "him,",
-  "who",
-  "receives",
-  "the",
-  "name",
-  "of",
-  "Beowulf--a",
-  "name",
-  "afterwards",
-  "made",
-  "so",
-  "famous",
-  "by",
-  "the",
-  "hero",
-  "of",
-  "the",
-  "poem.}",
   "A",
   "son",
   "and",
@@ -13851,8 +14721,7 @@ var fantasyWords = [
   "had",
   "caused",
   "them,",
-  "15",
-  "[1]That",
+  "That",
   "reaved",
   "of",
   "their",
@@ -13860,7 +14729,7 @@ var fantasyWords = [
   "they",
   "wretched",
   "had",
-  "erstwhile[2]",
+  "erstwhile",
   "Long",
   "been",
   "afflicted.",
@@ -13892,17 +14761,6 @@ var fantasyWords = [
   "of",
   "the",
   "Danemen.",
-  "[2]",
-  "{The",
-  "ideal",
-  "Teutonic",
-  "king",
-  "lavishes",
-  "gifts",
-  "on",
-  "his",
-  "vassals.}",
-  "20",
   "So",
   "the",
   "carle",
@@ -13943,7 +14801,6 @@ var fantasyWords = [
   "him",
   "as",
   "liegemen:",
-  "25",
   "By",
   "praise-worthy",
   "actions",
@@ -13962,14 +14819,6 @@ var fantasyWords = [
   "that",
   "was",
   "fated",
-  "{Scyld",
-  "dies",
-  "at",
-  "the",
-  "hour",
-  "appointed",
-  "by",
-  "Fate.}",
   "Scyld",
   "then",
   "departed",
@@ -13995,7 +14844,6 @@ var fantasyWords = [
   "his",
   "fond-loving",
   "comrades,",
-  "30",
   "As",
   "himself",
   "he",
@@ -14016,7 +14864,7 @@ var fantasyWords = [
   "Long",
   "did",
   "rule",
-  "them.[3]",
+  "them.",
   "The",
   "ring-stemmèd",
   "vessel,",
@@ -14035,21 +14883,6 @@ var fantasyWords = [
   "eager",
   "for",
   "sailing;",
-  "{By",
-  "his",
-  "own",
-  "request,",
-  "his",
-  "body",
-  "is",
-  "laid",
-  "on",
-  "a",
-  "vessel",
-  "and",
-  "wafted",
-  "seaward.}",
-  "35",
   "The",
   "belovèd",
   "leader",
@@ -14093,7 +14926,6 @@ var fantasyWords = [
   "I",
   "not",
   "ever",
-  "40",
   "That",
   "a",
   "folk",
@@ -14136,7 +14968,6 @@ var fantasyWords = [
   "on",
   "the",
   "current.",
-  "45",
   "And",
   "favors",
   "no",
@@ -14152,15 +14983,6 @@ var fantasyWords = [
   "had",
   "given",
   "him",
-  "{He",
-  "leaves",
-  "Daneland",
-  "on",
-  "the",
-  "breast",
-  "of",
-  "a",
-  "bark.}",
   "Who",
   "when",
   "first",
@@ -14187,8 +15009,6 @@ var fantasyWords = [
   "stretched",
   "under",
   "heaven",
-  "[3]",
-  "50",
   "High",
   "o'er",
   "his",
@@ -14213,13 +15033,6 @@ var fantasyWords = [
   "are",
   "not",
   "able",
-  "{No",
-  "one",
-  "knows",
-  "whither",
-  "the",
-  "boat",
-  "drifted.}",
   "Soothly",
   "to",
   "tell",
@@ -14228,7 +15041,7 @@ var fantasyWords = [
   "in",
   "halls",
   "who",
-  "reside,[4]",
+  "reside,",
   "Heroes",
   "under",
   "heaven,",
@@ -14237,7 +15050,6 @@ var fantasyWords = [
   "haven",
   "he",
   "hied.",
-  "[1]",
   "For",
   "the",
   "'Þæt'",
@@ -14261,10 +15073,10 @@ var fantasyWords = [
   "afflicted'",
   "will",
   "read:",
-  "_He_",
-  "(_i.e._",
+  "He",
+  "(i.e.",
   "God)",
-  "_had",
+  "had",
   "perceived",
   "the",
   "malice-caused",
@@ -14275,15 +15087,14 @@ var fantasyWords = [
   "had",
   "formerly",
   "long",
-  "endured_.",
-  "[2]",
+  "endured.",
   "For",
   "'aldor-léase'",
   "(15)",
   "Gr.",
   "suggested",
   "'aldor-ceare':",
-  "_He",
+  "He",
   "perceived",
   "their",
   "distress,",
@@ -14295,8 +15106,7 @@ var fantasyWords = [
   "life-sorrow",
   "a",
   "long",
-  "while_.",
-  "[3]",
+  "while.",
   "A",
   "very",
   "difficult",
@@ -14331,7 +15141,7 @@ var fantasyWords = [
   "'lændagas'",
   "for",
   "'lange':",
-  "_And",
+  "And",
   "the",
   "beloved",
   "land-prince",
@@ -14341,7 +15151,7 @@ var fantasyWords = [
   "transitory",
   "days",
   "(i.e.",
-  "lived)_.",
+  "lived).",
   "B.",
   "suggests",
   "a",
@@ -14359,7 +15169,6 @@ var fantasyWords = [
   "that",
   "eminent",
   "scholar.",
-  "[4]",
   "The",
   "reading",
   "of",
@@ -14387,7 +15196,7 @@ var fantasyWords = [
   "passage",
   "will",
   "read:",
-  "_Men",
+  "Men",
   "cannot",
   "tell",
   "us,",
@@ -14396,7 +15205,7 @@ var fantasyWords = [
   "order",
   "of",
   "Fate,",
-  "etc._",
+  "etc.",
   "'Sele-rædende'",
   "has",
   "two",
@@ -14417,16 +15226,6 @@ var fantasyWords = [
   "in",
   "v.",
   "50.",
-  "II.",
-  "SCYLD'S",
-  "SUCCESSORS.--HROTHGAR'S",
-  "GREAT",
-  "MEAD-HALL.",
-  "{Beowulf",
-  "succeeds",
-  "his",
-  "father",
-  "Scyld}",
   "In",
   "the",
   "boroughs",
@@ -14457,7 +15256,6 @@ var fantasyWords = [
   "till",
   "afterward",
   "sprang",
-  "5",
   "Great-minded",
   "Healfdene;",
   "the",
@@ -14470,8 +15268,6 @@ var fantasyWords = [
   "governed,",
   "grim-mooded,",
   "agèd.",
-  "{Healfdene's",
-  "birth.}",
   "Four",
   "bairns",
   "of",
@@ -14492,7 +15288,6 @@ var fantasyWords = [
   "Halga",
   "the",
   "good;",
-  "10",
   "Heard",
   "I",
   "that",
@@ -14500,22 +15295,6 @@ var fantasyWords = [
   "was",
   "Ongentheow's",
   "consort,",
-  "{He",
-  "has",
-  "three",
-  "sons--one",
-  "of",
-  "them,",
-  "Hrothgar--and",
-  "a",
-  "daughter",
-  "named",
-  "Elan.",
-  "Hrothgar",
-  "becomes",
-  "a",
-  "mighty",
-  "king.}",
   "The",
   "well-beloved",
   "bedmate",
@@ -14546,7 +15325,6 @@ var fantasyWords = [
   "grew",
   "to",
   "manhood,",
-  "15",
   "A",
   "numerous",
   "band.",
@@ -14572,21 +15350,6 @@ var fantasyWords = [
   "of",
   "the",
   "era",
-  "{He",
-  "is",
-  "eager",
-  "to",
-  "build",
-  "a",
-  "great",
-  "hall",
-  "in",
-  "which",
-  "he",
-  "may",
-  "feast",
-  "his",
-  "retainers}",
   "Ever",
   "had",
   "heard",
@@ -14604,7 +15367,6 @@ var fantasyWords = [
   "of",
   "the",
   "blessings",
-  "20",
   "The",
   "Lord",
   "had",
@@ -14622,7 +15384,6 @@ var fantasyWords = [
   "afar",
   "was",
   "assigned",
-  "[4]",
   "To",
   "many",
   "races",
@@ -14646,7 +15407,6 @@ var fantasyWords = [
   "'twas",
   "finished",
   "entirely,",
-  "25",
   "The",
   "greatest",
   "of",
@@ -14655,16 +15415,6 @@ var fantasyWords = [
   "he",
   "named",
   "it",
-  "{The",
-  "hall",
-  "is",
-  "completed,",
-  "and",
-  "is",
-  "called",
-  "Heort,",
-  "or",
-  "Heorot.}",
   "Who",
   "wide-reaching",
   "word-sway",
@@ -14692,7 +15442,6 @@ var fantasyWords = [
   "huge",
   "between",
   "antlers:",
-  "30",
   "It",
   "battle-waves",
   "bided,",
@@ -14717,21 +15466,11 @@ var fantasyWords = [
   "Then",
   "the",
   "mighty",
-  "war-spirit[1]",
+  "war-spirit",
   "endured",
   "for",
   "a",
   "season,",
-  "{The",
-  "Monster",
-  "Grendel",
-  "is",
-  "madly",
-  "envious",
-  "of",
-  "the",
-  "Danemen's",
-  "joy.}",
   "Bore",
   "it",
   "bitterly,",
@@ -14740,7 +15479,6 @@ var fantasyWords = [
   "bided",
   "in",
   "darkness,",
-  "35",
   "That",
   "light-hearted",
   "laughter",
@@ -14765,24 +15503,6 @@ var fantasyWords = [
   "that",
   "was",
   "able",
-  "{[The",
-  "course",
-  "of",
-  "the",
-  "story",
-  "is",
-  "interrupted",
-  "by",
-  "a",
-  "short",
-  "reference",
-  "to",
-  "some",
-  "old",
-  "account",
-  "of",
-  "the",
-  "creation.]}",
   "To",
   "tell",
   "from",
@@ -14796,7 +15516,6 @@ var fantasyWords = [
   "earth",
   "had",
   "created,",
-  "40",
   "The",
   "winsome",
   "wold",
@@ -14836,7 +15555,6 @@ var fantasyWords = [
   "He",
   "bestowed",
   "too",
-  "45",
   "On",
   "all",
   "the",
@@ -14845,17 +15563,6 @@ var fantasyWords = [
   "live",
   "under",
   "heaven.",
-  "{The",
-  "glee",
-  "of",
-  "the",
-  "warriors",
-  "is",
-  "overcast",
-  "by",
-  "a",
-  "horrible",
-  "dread.}",
   "So",
   "blessed",
   "with",
@@ -14886,15 +15593,14 @@ var fantasyWords = [
   "hall-building:",
   "this",
   "horrible",
-  "stranger[2]",
-  "50",
+  "stranger",
   "Was",
   "Grendel",
   "entitled,",
   "the",
   "march-stepper",
   "famous",
-  "Who[3]",
+  "Who",
   "dwelt",
   "in",
   "the",
@@ -14911,7 +15617,6 @@ var fantasyWords = [
   "for",
   "a",
   "season",
-  "[5]",
   "In",
   "the",
   "land",
@@ -14932,27 +15637,12 @@ var fantasyWords = [
   "that",
   "bitter",
   "murder,",
-  "55",
   "The",
   "killing",
   "of",
   "Abel,",
   "all-ruling",
   "Father",
-  "{Cain",
-  "is",
-  "referred",
-  "to",
-  "as",
-  "a",
-  "progenitor",
-  "of",
-  "Grendel,",
-  "and",
-  "of",
-  "monsters",
-  "in",
-  "general.}",
   "The",
   "kindred",
   "of",
@@ -14987,7 +15677,6 @@ var fantasyWords = [
   "Thence",
   "ill-favored",
   "creatures,",
-  "60",
   "Elves",
   "and",
   "giants,",
@@ -15009,7 +15698,6 @@ var fantasyWords = [
   "gave",
   "them",
   "requital.",
-  "[1]",
   "R.",
   "and",
   "t.",
@@ -15019,30 +15707,28 @@ var fantasyWords = [
   "to",
   "'ellen-gæst'",
   "(86):",
-  "_Then",
+  "Then",
   "the",
   "stranger",
   "from",
   "afar",
   "endured,",
-  "etc._",
-  "[2]",
+  "etc.",
   "Some",
   "authorities",
   "would",
   "translate",
-  "'_demon_'",
+  "'demon'",
   "instead",
   "of",
-  "'_stranger_.'",
-  "[3]",
+  "'stranger.'",
   "Some",
   "authorities",
   "arrange",
   "differently,",
   "and",
   "render:",
-  "_Who",
+  "Who",
   "dwelt",
   "in",
   "the",
@@ -15056,16 +15742,7 @@ var fantasyWords = [
   "land",
   "of",
   "the",
-  "giant-race._",
-  "III.",
-  "GRENDEL",
-  "THE",
-  "MURDERER.",
-  "{Grendel",
-  "attacks",
-  "the",
-  "sleeping",
-  "heroes}",
+  "giant-race.",
   "When",
   "the",
   "sun",
@@ -15102,13 +15779,12 @@ var fantasyWords = [
   "many",
   "a",
   "noble",
-  "5",
   "Asleep",
   "after",
   "supper;",
   "sorrow",
   "the",
-  "heroes,[1]",
+  "heroes,",
   "Misery",
   "knew",
   "not.",
@@ -15122,15 +15798,6 @@ var fantasyWords = [
   "tarried",
   "but",
   "little,",
-  "{He",
-  "drags",
-  "off",
-  "thirty",
-  "of",
-  "them,",
-  "and",
-  "devours",
-  "them}",
   "Fell",
   "and",
   "frantic,",
@@ -15145,7 +15812,6 @@ var fantasyWords = [
   "thence",
   "he",
   "departed",
-  "10",
   "Leaping",
   "and",
   "laughing,",
@@ -15179,19 +15845,6 @@ var fantasyWords = [
   "to",
   "the",
   "warriors:",
-  "{A",
-  "cry",
-  "of",
-  "agony",
-  "goes",
-  "up,",
-  "when",
-  "Grendel's",
-  "horrible",
-  "deed",
-  "is",
-  "fully",
-  "realized.}",
   "Then,",
   "his",
   "meal-taking",
@@ -15200,7 +15853,6 @@ var fantasyWords = [
   "moan",
   "was",
   "uplifted,",
-  "15",
   "Morning-cry",
   "mighty.",
   "The",
@@ -15219,7 +15871,6 @@ var fantasyWords = [
   "for",
   "his",
   "liegemen,",
-  "[6]",
   "When",
   "they",
   "had",
@@ -15237,13 +15888,6 @@ var fantasyWords = [
   "crushing",
   "that",
   "sorrow,",
-  "{The",
-  "monster",
-  "returns",
-  "the",
-  "next",
-  "night.}",
-  "20",
   "Too",
   "loathsome",
   "and",
@@ -15283,7 +15927,6 @@ var fantasyWords = [
   "otherwhere",
   "looked",
   "for",
-  "25",
   "A",
   "pleasanter",
   "place",
@@ -15324,8 +15967,7 @@ var fantasyWords = [
   "foeman",
   "did",
   "baffle.",
-  "30",
-  "[2]So",
+  "So",
   "ruled",
   "he",
   "and",
@@ -15340,14 +15982,6 @@ var fantasyWords = [
   "till",
   "empty",
   "uptowered",
-  "{King",
-  "Hrothgar's",
-  "agony",
-  "and",
-  "suspense",
-  "last",
-  "twelve",
-  "years.}",
   "The",
   "choicest",
   "of",
@@ -15367,12 +16001,11 @@ var fantasyWords = [
   "Scyldings,",
   "every",
   "affliction,",
-  "35",
   "Endless",
   "agony;",
   "hence",
   "it",
-  "after[3]",
+  "after",
   "became",
   "Certainly",
   "known",
@@ -15398,14 +16031,13 @@ var fantasyWords = [
   "many",
   "a",
   "winter,",
-  "40",
   "Strife",
   "unremitting,",
   "and",
   "peacefully",
   "wished",
   "he",
-  "[4]Life-woe",
+  "Life-woe",
   "to",
   "lift",
   "from",
@@ -15430,7 +16062,6 @@ var fantasyWords = [
   "for",
   "a",
   "moment",
-  "[7]",
   "On",
   "handsome",
   "amends",
@@ -15440,13 +16071,6 @@ var fantasyWords = [
   "of",
   "the",
   "murderer;",
-  "{Grendel",
-  "is",
-  "unremitting",
-  "in",
-  "his",
-  "persecutions.}",
-  "45",
   "The",
   "monster",
   "of",
@@ -15484,7 +16108,6 @@ var fantasyWords = [
   "wander",
   "and",
   "ramble.",
-  "50",
   "So",
   "the",
   "foe",
@@ -15508,11 +16131,6 @@ var fantasyWords = [
   "night-shades",
   "had",
   "fallen",
-  "{God",
-  "is",
-  "against",
-  "the",
-  "monster.}",
   "(Since",
   "God",
   "did",
@@ -15523,8 +16141,7 @@ var fantasyWords = [
   "throne",
   "could",
   "he",
-  "touch,[5]",
-  "55",
+  "touch,",
   "The",
   "light-flashing",
   "jewel,",
@@ -15543,14 +16160,6 @@ var fantasyWords = [
   "of",
   "the",
   "Scyldings",
-  "{The",
-  "king",
-  "and",
-  "his",
-  "council",
-  "deliberate",
-  "in",
-  "vain.}",
   "Soul-crushing",
   "sorrow.",
   "Not",
@@ -15575,14 +16184,6 @@ var fantasyWords = [
   "terrors",
   "unlooked",
   "for.",
-  "{They",
-  "invoke",
-  "the",
-  "aid",
-  "of",
-  "their",
-  "gods.}",
-  "60",
   "At",
   "the",
   "shrines",
@@ -15622,7 +16223,6 @@ var fantasyWords = [
   "hell",
   "they",
   "remembered",
-  "65",
   "In",
   "innermost",
   "spirit,",
@@ -15630,13 +16230,6 @@ var fantasyWords = [
   "they",
   "knew",
   "not,",
-  "{The",
-  "true",
-  "God",
-  "they",
-  "do",
-  "not",
-  "know.}",
   "Judge",
   "of",
   "their",
@@ -15669,7 +16262,6 @@ var fantasyWords = [
   "shall",
   "drive",
   "to",
-  "70",
   "The",
   "clutch",
   "of",
@@ -15702,7 +16294,6 @@ var fantasyWords = [
   "his",
   "Father's",
   "embrace!",
-  "[1]",
   "The",
   "translation",
   "is",
@@ -15721,7 +16312,7 @@ var fantasyWords = [
   "differently,",
   "render",
   "119(2)-120:",
-  "_They",
+  "They",
   "knew",
   "not",
   "sorrow,",
@@ -15731,25 +16322,24 @@ var fantasyWords = [
   "man,",
   "aught",
   "of",
-  "misfortune_.--For",
+  "misfortune.--For",
   "'unhælo'",
   "(120)",
   "R.",
   "suggests",
   "'unfælo':",
-  "_The",
+  "The",
   "uncanny",
   "creature,",
   "greedy",
   "and",
   "cruel,",
-  "etc_.",
-  "[2]",
+  "etc.",
   "S.",
   "rearranges",
   "and",
   "translates:",
-  "_So",
+  "So",
   "he",
   "ruled",
   "and",
@@ -15784,14 +16374,13 @@ var fantasyWords = [
   "woe,",
   "great",
   "sorrows,",
-  "etc_.",
-  "[3]",
+  "etc.",
   "For",
   "'syððan,'",
   "B.",
   "suggests",
   "'sárcwidum':",
-  "_Hence",
+  "Hence",
   "in",
   "mournful",
   "words",
@@ -15799,7 +16388,7 @@ var fantasyWords = [
   "became",
   "well",
   "known,",
-  "etc_.",
+  "etc.",
   "Various",
   "other",
   "words",
@@ -15809,7 +16398,6 @@ var fantasyWords = [
   "have",
   "been",
   "conjectured.",
-  "[4]",
   "The",
   "H.-So.",
   "glossary",
@@ -15842,7 +16430,7 @@ var fantasyWords = [
   "Deniga,",
   "he",
   "renders:",
-  "_He",
+  "He",
   "did",
   "not",
   "desire",
@@ -15864,8 +16452,7 @@ var fantasyWords = [
   "to",
   "settle",
   "for",
-  "money_.",
-  "[5]",
+  "money.",
   "Of",
   "this",
   "difficult",
@@ -15931,7 +16518,7 @@ var fantasyWords = [
   "of",
   "the",
   "Creator;",
-  "_i.e._",
+  "i.e.",
   "God",
   "wished",
   "to",
@@ -15946,38 +16533,20 @@ var fantasyWords = [
   "(169)",
   "W.",
   "renders:",
-  "_Nor",
+  "Nor",
   "had",
   "he",
   "any",
   "desire",
   "to",
   "do",
-  "so_;",
+  "so;",
   "'his'",
   "being",
   "obj.",
   "gen.",
   "=",
   "danach.",
-  "[8]",
-  "IV.",
-  "BEOWULF",
-  "GOES",
-  "TO",
-  "HROTHGAR'S",
-  "ASSISTANCE.",
-  "{Hrothgar",
-  "sees",
-  "no",
-  "way",
-  "of",
-  "escape",
-  "from",
-  "the",
-  "persecutions",
-  "of",
-  "Grendel.}",
   "So",
   "Healfdene's",
   "kinsman",
@@ -16007,31 +16576,12 @@ var fantasyWords = [
   "to",
   "the",
   "people,",
-  "5",
   "Loathsome",
   "and",
   "lasting",
   "the",
   "life-grinding",
   "torture,",
-  "{Beowulf,",
-  "the",
-  "Geat,",
-  "hero",
-  "of",
-  "the",
-  "poem,",
-  "hears",
-  "of",
-  "Hrothgar's",
-  "sorrow,",
-  "and",
-  "resolves",
-  "to",
-  "go",
-  "to",
-  "his",
-  "assistance.}",
   "Greatest",
   "of",
   "night-woes.",
@@ -16047,7 +16597,7 @@ var fantasyWords = [
   "Heard",
   "in",
   "his",
-  "home:[1]",
+  "home:",
   "of",
   "heroes",
   "then",
@@ -16060,7 +16610,6 @@ var fantasyWords = [
   "sturdy",
   "and",
   "noble.",
-  "10",
   "He",
   "bade",
   "them",
@@ -16101,7 +16650,6 @@ var fantasyWords = [
   "loving",
   "him",
   "dearly;",
-  "15",
   "They",
   "egged",
   "the",
@@ -16110,16 +16658,6 @@ var fantasyWords = [
   "augured",
   "him",
   "glory.",
-  "{With",
-  "fourteen",
-  "carefully",
-  "chosen",
-  "companions,",
-  "he",
-  "sets",
-  "out",
-  "for",
-  "Dane-land.}",
   "The",
   "excellent",
   "knight",
@@ -16151,7 +16689,6 @@ var fantasyWords = [
   "then",
   "showed",
   "them,",
-  "20",
   "A",
   "sea-crafty",
   "man,",
@@ -16191,7 +16728,6 @@ var fantasyWords = [
   "soldiers",
   "then",
   "carried",
-  "25",
   "On",
   "the",
   "breast",
@@ -16212,13 +16748,6 @@ var fantasyWords = [
   "its",
   "wished-for",
   "adventure.",
-  "[9]",
-  "{The",
-  "vessel",
-  "sails",
-  "like",
-  "a",
-  "bird}",
   "The",
   "foamy-necked",
   "floater",
@@ -16232,18 +16761,6 @@ var fantasyWords = [
   "glided",
   "the",
   "waters,",
-  "{In",
-  "twenty",
-  "four",
-  "hours",
-  "they",
-  "reach",
-  "the",
-  "shores",
-  "of",
-  "Hrothgar's",
-  "dominions}",
-  "30",
   "Till",
   "twenty",
   "and",
@@ -16277,13 +16794,12 @@ var fantasyWords = [
   "nearing",
   "the",
   "limits",
-  "35",
   "At",
   "the",
   "end",
   "of",
   "the",
-  "ocean.[2]",
+  "ocean.",
   "Up",
   "thence",
   "quickly",
@@ -16319,15 +16835,6 @@ var fantasyWords = [
   "waxen",
   "so",
   "gentle.",
-  "{They",
-  "are",
-  "hailed",
-  "by",
-  "the",
-  "Danish",
-  "coast",
-  "guard}",
-  "40",
   "Then",
   "well",
   "from",
@@ -16367,7 +16874,6 @@ var fantasyWords = [
   "men",
   "were",
   "approaching.",
-  "45",
   "High",
   "on",
   "his",
@@ -16389,8 +16895,6 @@ var fantasyWords = [
   "questioned",
   "with",
   "boldness.",
-  "{His",
-  "challenge}",
   '"Who',
   "are",
   "ye",
@@ -16405,7 +16909,6 @@ var fantasyWords = [
   "come",
   "thus",
   "a-driving",
-  "50",
   "A",
   "high",
   "riding",
@@ -16416,7 +16919,7 @@ var fantasyWords = [
   "of",
   "the",
   "waters,",
-  "[3]And",
+  "And",
   "hither",
   "'neath",
   "helmets",
@@ -16425,7 +16928,6 @@ var fantasyWords = [
   "o'er",
   "the",
   "ocean?",
-  "[10]",
   "I",
   "have",
   "been",
@@ -16444,7 +16946,6 @@ var fantasyWords = [
   "army",
   "of",
   "war-ships.",
-  "55",
   "More",
   "boldly",
   "never",
@@ -16465,12 +16966,6 @@ var fantasyWords = [
   "that",
   "ye",
   "surely",
-  "{He",
-  "is",
-  "struck",
-  "by",
-  "Beowulf's",
-  "appearance.}",
   "Nothing",
   "have",
   "known.",
@@ -16484,12 +16979,11 @@ var fantasyWords = [
   "the",
   "earth",
   "have",
-  "_I_",
+  "I",
   "had",
   "a",
   "sight",
   "of",
-  "60",
   "Than",
   "is",
   "one",
@@ -16502,7 +16996,7 @@ var fantasyWords = [
   "armor;",
   "No",
   "low-ranking",
-  "fellow[4]",
+  "fellow",
   "adorned",
   "with",
   "his",
@@ -16533,7 +17027,6 @@ var fantasyWords = [
   "of",
   "the",
   "Scyldings",
-  "65",
   "And",
   "farther",
   "fare,",
@@ -16573,7 +17066,6 @@ var fantasyWords = [
   "are",
   "come",
   'from."',
-  "[1]",
   "'From",
   "hám'",
   "(194)",
@@ -16583,7 +17075,7 @@ var fantasyWords = [
   "One",
   "rendering",
   "is:",
-  "_Beowulf,",
+  "Beowulf,",
   "being",
   "away",
   "from",
@@ -16592,7 +17084,7 @@ var fantasyWords = [
   "of",
   "Hrothgar's",
   "troubles,",
-  "etc_.",
+  "etc.",
   "Another,",
   "that",
   "adopted",
@@ -16605,21 +17097,21 @@ var fantasyWords = [
   "H.-So.",
   "notes,",
   "is:",
-  "_B.",
+  "B.",
   "heard",
   "from",
   "his",
   "neighborhood",
-  "(neighbors),_",
+  "(neighbors),",
   "i.e.",
-  "_in",
+  "in",
   "his",
   "home,",
-  "etc_.",
+  "etc.",
   "A",
   "third",
   "is:",
-  "_B.,",
+  "B.,",
   "being",
   "at",
   "home,",
@@ -16629,14 +17121,13 @@ var fantasyWords = [
   "occurring",
   "away",
   "from",
-  "home_.",
+  "home.",
   "The",
   "H.-So.",
   "glossary",
   "and",
   "notes",
   "conflict.",
-  "[2]",
   "'Eoletes'",
   "(224)",
   "is",
@@ -16658,14 +17149,13 @@ var fantasyWords = [
   "'eolet'",
   "are:",
   "(1)",
-  "_voyage_,",
+  "voyage,",
   "(2)",
-  "_toil_,",
-  "_labor_,",
+  "toil,",
+  "labor,",
   "(3)",
-  "_hasty",
-  "journey_.",
-  "[3]",
+  "hasty",
+  "journey.",
   "The",
   "lacuna",
   "of",
@@ -16745,7 +17235,7 @@ var fantasyWords = [
   "the",
   "line.",
   "Translate:",
-  "_What",
+  "What",
   "warriors",
   "are",
   "ye,",
@@ -16779,7 +17269,7 @@ var fantasyWords = [
   "been",
   "coast",
   "guard,",
-  "etc_.",
+  "etc.",
   "S.",
   "endorses",
   "most",
@@ -16808,41 +17298,32 @@ var fantasyWords = [
   "51",
   "above",
   "to,",
-  "_A",
+  "A",
   "ring-stemmed",
   "vessel",
   "hither",
-  "o'ersea_.",
-  "[4]",
+  "o'ersea.",
   "'Seld-guma'",
   "(249)",
   "is",
   "variously",
   "rendered:",
   "(1)",
-  "_housecarle_;",
+  "housecarle;",
   "(2)",
-  "_home-stayer_;",
+  "home-stayer;",
   "(3)",
-  "_common",
-  "man_.",
+  "common",
+  "man.",
   "Dr.",
   "H.",
   "Wood",
   "suggests",
-  "_a",
+  "a",
   "man-at-arms",
   "in",
   "another's",
-  "house_.",
-  "V.",
-  "THE",
-  "GEATS",
-  "REACH",
-  "HEOROT.",
-  "{Beowulf",
-  "courteously",
-  "replies.}",
+  "house.",
   "The",
   "chief",
   "of",
@@ -16856,9 +17337,6 @@ var fantasyWords = [
   "and",
   "word-treasure",
   "opened:",
-  "{We",
-  "are",
-  "Geats.}",
   '"We',
   "are",
   "sprung",
@@ -16876,15 +17354,6 @@ var fantasyWords = [
   "To",
   "heroes",
   "unnumbered",
-  "{My",
-  "father",
-  "Ecgtheow",
-  "was",
-  "well-known",
-  "in",
-  "his",
-  "day.}",
-  "5",
   "My",
   "father",
   "was",
@@ -16922,16 +17391,6 @@ var fantasyWords = [
   "well",
   "remembers",
   "him.",
-  "{Our",
-  "intentions",
-  "towards",
-  "King",
-  "Hrothgar",
-  "are",
-  "of",
-  "the",
-  "kindest.}",
-  "10",
   "We,",
   "kindly",
   "of",
@@ -16951,7 +17410,6 @@ var fantasyWords = [
   "here",
   "to",
   "visit,",
-  "[11]",
   "Folk-troop's",
   "defender:",
   "be",
@@ -16978,17 +17436,6 @@ var fantasyWords = [
   "hide,",
   "I",
   "ween,",
-  "{Is",
-  "it",
-  "true",
-  "that",
-  "a",
-  "monster",
-  "is",
-  "slaying",
-  "Danish",
-  "heroes?}",
-  "15",
   "Naught",
   "of",
   "our",
@@ -17028,7 +17475,6 @@ var fantasyWords = [
   "of,",
   "horrid",
   "destruction",
-  "20",
   "And",
   "the",
   "falling",
@@ -17038,18 +17484,6 @@ var fantasyWords = [
   "feelings",
   "least",
   "selfish",
-  "{I",
-  "can",
-  "help",
-  "your",
-  "king",
-  "to",
-  "free",
-  "himself",
-  "from",
-  "this",
-  "horrible",
-  "creature.}",
   "I",
   "am",
   "able",
@@ -17075,7 +17509,7 @@ var fantasyWords = [
   "should",
   "ever",
   "be",
-  "lessened,[1]",
+  "lessened,",
   "Comfort",
   "come",
   "to",
@@ -17084,7 +17518,6 @@ var fantasyWords = [
   "care-waves",
   "grow",
   "cooler,",
-  "25",
   "Or",
   "ever",
   "hereafter",
@@ -17105,19 +17538,6 @@ var fantasyWords = [
   "on",
   "the",
   'summit."',
-  "{The",
-  "coast-guard",
-  "reminds",
-  "Beowulf",
-  "that",
-  "it",
-  "is",
-  "easier",
-  "to",
-  "say",
-  "than",
-  "to",
-  "do.}",
   "Bestriding",
   "his",
   "stallion,",
@@ -17130,7 +17550,6 @@ var fantasyWords = [
   '"The',
   "difference",
   "surely",
-  "30",
   "'Twixt",
   "words",
   "and",
@@ -17151,20 +17570,6 @@ var fantasyWords = [
   "beareth",
   "no",
   "malice",
-  "{I",
-  "am",
-  "satisfied",
-  "of",
-  "your",
-  "good",
-  "intentions,",
-  "and",
-  "shall",
-  "lead",
-  "you",
-  "to",
-  "the",
-  "palace.}",
   "To",
   "the",
   "prince",
@@ -17185,7 +17590,6 @@ var fantasyWords = [
   "you",
   "in",
   "person;",
-  "35",
   "To",
   "my",
   "war-trusty",
@@ -17202,17 +17606,6 @@ var fantasyWords = [
   "your",
   "excellent",
   "vessel,",
-  "{Your",
-  "boat",
-  "shall",
-  "be",
-  "well",
-  "cared",
-  "for",
-  "during",
-  "your",
-  "stay",
-  "here.}",
   "Your",
   "fresh-tarred",
   "craft,",
@@ -17234,7 +17627,6 @@ var fantasyWords = [
   "the",
   "well-beloved",
   "hero",
-  "40",
   "O'er",
   "the",
   "way",
@@ -17244,10 +17636,6 @@ var fantasyWords = [
   "to",
   "Weder",
   "dominions.",
-  "{He",
-  "again",
-  "compliments",
-  "Beowulf.}",
   "To",
   "warrior",
   "so",
@@ -17280,14 +17668,12 @@ var fantasyWords = [
   "by",
   "its",
   "cable,",
-  "[12]",
-  "45",
   "Firmly",
   "at",
   "anchor);",
   "the",
   "boar-signs",
-  "glistened[2]",
+  "glistened",
   "Bright",
   "on",
   "the",
@@ -17307,11 +17693,6 @@ var fantasyWords = [
   "hurried",
   "the",
   "liegemen,",
-  "{The",
-  "land",
-  "is",
-  "perhaps",
-  "rolling.}",
   "Descended",
   "together,",
   "till",
@@ -17320,18 +17701,12 @@ var fantasyWords = [
   "the",
   "great",
   "palace,",
-  "50",
   "The",
   "well-fashioned",
   "wassail-hall",
   "wondrous",
   "and",
   "gleaming:",
-  "{Heorot",
-  "flashes",
-  "on",
-  "their",
-  "view.}",
   "'Mid",
   "world-folk",
   "and",
@@ -17363,7 +17738,6 @@ var fantasyWords = [
   "them",
   "the",
   "glittering",
-  "55",
   "Court",
   "of",
   "the",
@@ -17389,15 +17763,6 @@ var fantasyWords = [
   "he",
   "left",
   "them:",
-  "{The",
-  "coast-guard,",
-  "having",
-  "discharged",
-  "his",
-  "duty,",
-  "bids",
-  "them",
-  "God-speed.}",
   `"'Tis`,
   "time",
   "I",
@@ -17414,7 +17779,6 @@ var fantasyWords = [
   "you",
   "to",
   "journey",
-  "60",
   "Safe",
   "on",
   "your",
@@ -17433,7 +17797,6 @@ var fantasyWords = [
   "warden",
   "to",
   'stand."',
-  "[1]",
   "'Edwendan'",
   "(280)",
   "B.",
@@ -17454,20 +17817,19 @@ var fantasyWords = [
   "sing.,",
   "limiting",
   "'edwenden':",
-  "_If",
+  "If",
   "reparation",
   "for",
   "sorrows",
   "is",
   "ever",
   "to",
-  "come_.",
+  "come.",
   "This",
   "is",
   "supported",
   "by",
   "t.B.",
-  "[2]",
   "Combining",
   "the",
   "emendations",
@@ -17478,7 +17840,7 @@ var fantasyWords = [
   "we",
   "may",
   "read:",
-  "_The",
+  "The",
   "boar-images",
   "glistened",
   "...",
@@ -17489,7 +17851,7 @@ var fantasyWords = [
   "of",
   "the",
   "war-mooded",
-  "man_.",
+  "man.",
   "They",
   "read",
   "'ferh-wearde'",
@@ -17498,13 +17860,6 @@ var fantasyWords = [
   "'gúðmódgum",
   "men'",
   "(306).",
-  "VI.",
-  "BEOWULF",
-  "INTRODUCES",
-  "HIMSELF",
-  "AT",
-  "THE",
-  "PALACE.",
   "The",
   "highway",
   "glistened",
@@ -17517,7 +17872,7 @@ var fantasyWords = [
   "the",
   "liegemen",
   "together.",
-  "[1]Firm",
+  "Firm",
   "and",
   "hand-locked",
   "the",
@@ -17530,7 +17885,6 @@ var fantasyWords = [
   "'mid",
   "the",
   "armor",
-  "5",
   "As",
   "the",
   "party",
@@ -17539,15 +17893,6 @@ var fantasyWords = [
   "the",
   "palace",
   "together",
-  "{They",
-  "set",
-  "their",
-  "arms",
-  "and",
-  "armor",
-  "against",
-  "the",
-  "wall.}",
   "In",
   "warlike",
   "equipments.",
@@ -17565,7 +17910,6 @@ var fantasyWords = [
   "did",
   "set",
   "then,",
-  "[13]",
   "Battle-shields",
   "sturdy;",
   "benchward",
@@ -17580,7 +17924,6 @@ var fantasyWords = [
   "of",
   "the",
   "heroes;",
-  "10",
   "The",
   "lances",
   "stood",
@@ -17604,17 +17947,6 @@ var fantasyWords = [
   "the",
   "armor-clad",
   "troopers",
-  "{A",
-  "Danish",
-  "hero",
-  "asks",
-  "them",
-  "whence",
-  "and",
-  "why",
-  "they",
-  "are",
-  "come.}",
   "Were",
   "decked",
   "with",
@@ -17630,7 +17962,6 @@ var fantasyWords = [
   "questions",
   "of",
   "lineage:",
-  "15",
   '"From',
   "what",
   "borders",
@@ -17669,15 +18000,6 @@ var fantasyWords = [
   "I",
   "have",
   "never",
-  "{He",
-  "expresses",
-  "no",
-  "little",
-  "admiration",
-  "for",
-  "the",
-  "strangers.}",
-  "20",
   "Men",
   "so",
   "many",
@@ -17686,20 +18008,133 @@ var fantasyWords = [
   "more",
   "courageous."
 ];
+var fantasySentences = [
+  { words: ["Lo!", "the", "Spear-Danes'", "glory", "through", "splendid", "achievements", "The", "folk-kings'", "former", "fame", "we", "have", "heard", "of,", "How", "princes", "displayed", "then", "their", "prowess-in-battle."], text: "Lo! the Spear-Danes' glory through splendid achievements The folk-kings' former fame we have heard of, How princes displayed then their prowess-in-battle." },
+  { words: ["Oft", "Scyld", "the", "Scefing", "from", "scathers", "in", "numbers", "From", "many", "a", "people", "their", "mead-benches", "tore."], text: "Oft Scyld the Scefing from scathers in numbers From many a people their mead-benches tore." },
+  { words: ["Since", "first", "he", "found", "him", "friendless", "and", "wretched,", "The", "earl", "had", "had", "terror:", "comfort", "he", "got", "for", "it,", "Waxed", "'neath", "the", "welkin,", "world-honor", "gained,", "Till", "all", "his", "neighbors", "o'er", "sea", "were", "compelled", "to", "Bow", "to", "his", "bidding", "and", "bring", "him", "their", "tribute:", "An", "excellent", "atheling!"], text: "Since first he found him friendless and wretched, The earl had had terror: comfort he got for it, Waxed 'neath the welkin, world-honor gained, Till all his neighbors o'er sea were compelled to Bow to his bidding and bring him their tribute: An excellent atheling!" },
+  { words: ["After", "was", "borne", "him", "A", "son", "and", "heir,", "young", "in", "his", "dwelling,", "Whom", "God-Father", "sent", "to", "solace", "the", "people."], text: "After was borne him A son and heir, young in his dwelling, Whom God-Father sent to solace the people." },
+  { words: ["He", "had", "marked", "the", "misery", "malice", "had", "caused", "them,", "That", "reaved", "of", "their", "rulers", "they", "wretched", "had", "erstwhile", "Long", "been", "afflicted."], text: "He had marked the misery malice had caused them, That reaved of their rulers they wretched had erstwhile Long been afflicted." },
+  { words: ["The", "Lord,", "in", "requital,", "Wielder", "of", "Glory,", "with", "world-honor", "blessed", "him."], text: "The Lord, in requital, Wielder of Glory, with world-honor blessed him." },
+  { words: ["Famed", "was", "Beowulf,", "far", "spread", "the", "glory", "Of", "Scyld's", "great", "son", "in", "the", "lands", "of", "the", "Danemen."], text: "Famed was Beowulf, far spread the glory Of Scyld's great son in the lands of the Danemen." },
+  { words: ["So", "the", "carle", "that", "is", "young,", "by", "kindnesses", "rendered", "The", "friends", "of", "his", "father,", "with", "fees", "in", "abundance", "Must", "be", "able", "to", "earn", "that", "when", "age", "approacheth", "Eager", "companions", "aid", "him", "requitingly,", "When", "war", "assaults", "him", "serve", "him", "as", "liegemen:", "By", "praise-worthy", "actions", "must", "honor", "be", "got", "'Mong", "all", "of", "the", "races."], text: "So the carle that is young, by kindnesses rendered The friends of his father, with fees in abundance Must be able to earn that when age approacheth Eager companions aid him requitingly, When war assaults him serve him as liegemen: By praise-worthy actions must honor be got 'Mong all of the races." },
+  { words: ["At", "the", "hour", "that", "was", "fated", "Scyld", "then", "departed", "to", "the", "All-Father's", "keeping", "Warlike", "to", "wend", "him;", "away", "then", "they", "bare", "him", "To", "the", "flood", "of", "the", "current,", "his", "fond-loving", "comrades,", "As", "himself", "he", "had", "bidden,", "while", "the", "friend", "of", "the", "Scyldings", "Word-sway", "wielded,", "and", "the", "well-lovèd", "land-prince", "Long", "did", "rule", "them."], text: "At the hour that was fated Scyld then departed to the All-Father's keeping Warlike to wend him; away then they bare him To the flood of the current, his fond-loving comrades, As himself he had bidden, while the friend of the Scyldings Word-sway wielded, and the well-lovèd land-prince Long did rule them." },
+  { words: ["The", "ring-stemmèd", "vessel,", "Bark", "of", "the", "atheling,", "lay", "there", "at", "anchor,", "Icy", "in", "glimmer", "and", "eager", "for", "sailing;", "The", "belovèd", "leader", "laid", "they", "down", "there,", "Giver", "of", "rings,", "on", "the", "breast", "of", "the", "vessel,", "The", "famed", "by", "the", "mainmast."], text: "The ring-stemmèd vessel, Bark of the atheling, lay there at anchor, Icy in glimmer and eager for sailing; The belovèd leader laid they down there, Giver of rings, on the breast of the vessel, The famed by the mainmast." },
+  { words: ["A", "many", "of", "jewels,", "Of", "fretted", "embossings,", "from", "far-lands", "brought", "over,", "Was", "placed", "near", "at", "hand", "then;", "and", "heard", "I", "not", "ever", "That", "a", "folk", "ever", "furnished", "a", "float", "more", "superbly", "With", "weapons", "of", "warfare,", "weeds", "for", "the", "battle,", "Bills", "and", "burnies;", "on", "his", "bosom", "sparkled", "Many", "a", "jewel", "that", "with", "him", "must", "travel", "On", "the", "flush", "of", "the", "flood", "afar", "on", "the", "current."], text: "A many of jewels, Of fretted embossings, from far-lands brought over, Was placed near at hand then; and heard I not ever That a folk ever furnished a float more superbly With weapons of warfare, weeds for the battle, Bills and burnies; on his bosom sparkled Many a jewel that with him must travel On the flush of the flood afar on the current." },
+  { words: ["And", "favors", "no", "fewer", "they", "furnished", "him", "soothly,", "Excellent", "folk-gems,", "than", "others", "had", "given", "him", "Who", "when", "first", "he", "was", "born", "outward", "did", "send", "him", "Lone", "on", "the", "main,", "the", "merest", "of", "infants:", "And", "a", "gold-fashioned", "standard", "they", "stretched", "under", "heaven", "High", "o'er", "his", "head,", "let", "the", "holm-currents", "bear", "him,", "Seaward", "consigned", "him:", "sad", "was", "their", "spirit,", "Their", "mood", "very", "mournful."], text: "And favors no fewer they furnished him soothly, Excellent folk-gems, than others had given him Who when first he was born outward did send him Lone on the main, the merest of infants: And a gold-fashioned standard they stretched under heaven High o'er his head, let the holm-currents bear him, Seaward consigned him: sad was their spirit, Their mood very mournful." },
+  { words: ["Men", "are", "not", "able", "Soothly", "to", "tell", "us,", "they", "in", "halls", "who", "reside,", "Heroes", "under", "heaven,", "to", "what", "haven", "he", "hied."], text: "Men are not able Soothly to tell us, they in halls who reside, Heroes under heaven, to what haven he hied." },
+  { words: ["For", "the", "'Þæt'", "of", "verse", "15,", "Sievers", "suggests", "'Þá'", "(=", "which)."], text: "For the 'Þæt' of verse 15, Sievers suggests 'Þá' (= which)." },
+  { words: ["If", "this", "be", "accepted,", "the", "sentence", "'He", "had", "...", "afflicted'", "will", "read:", "He", "(i.e."], text: "If this be accepted, the sentence 'He had ... afflicted' will read: He (i.e." },
+  { words: ["God)", "had", "perceived", "the", "malice-caused", "sorrow", "which", "they,", "lordless,", "had", "formerly", "long", "endured."], text: "God) had perceived the malice-caused sorrow which they, lordless, had formerly long endured." },
+  { words: ["For", "'aldor-léase'", "(15)", "Gr.", "suggested", "'aldor-ceare':", "He", "perceived", "their", "distress,", "that", "they", "formerly", "had", "suffered", "life-sorrow", "a", "long", "while."], text: "For 'aldor-léase' (15) Gr. suggested 'aldor-ceare': He perceived their distress, that they formerly had suffered life-sorrow a long while." },
+  { words: ["A", "very", "difficult", "passage."], text: "A very difficult passage." },
+  { words: ["'Áhte'", "(31)", "has", "no", "object."], text: "'Áhte' (31) has no object." },
+  { words: ["H.", "supplies", "'geweald'", "from", "the", "context;", "and", "our", "translation", "is", "based", "upon", "this", "assumption,", "though", "it", "is", "far", "from", "satisfactory."], text: "H. supplies 'geweald' from the context; and our translation is based upon this assumption, though it is far from satisfactory." },
+  { words: ["Kl.", "suggests", "'lændagas'", "for", "'lange':", "And", "the", "beloved", "land-prince", "enjoyed", "(had)", "his", "transitory", "days", "(i.e.", "lived)."], text: "Kl. suggests 'lændagas' for 'lange': And the beloved land-prince enjoyed (had) his transitory days (i.e. lived)." },
+  { words: ["B.", "suggests", "a", "dislocation;", "but", "this", "is", "a", "dangerous", "doctrine,", "pushed", "rather", "far", "by", "that", "eminent", "scholar."], text: "B. suggests a dislocation; but this is a dangerous doctrine, pushed rather far by that eminent scholar." },
+  { words: ["The", "reading", "of", "the", "H.-So.", "text", "has", "been", "quite", "closely", "followed;", "but", "some", "eminent", "scholars", "read", "'séle-rædenne'", "for", "'sele-rædende.'"], text: "The reading of the H.-So. text has been quite closely followed; but some eminent scholars read 'séle-rædenne' for 'sele-rædende.'" },
+  { words: ["If", "that", "be", "adopted,", "the", "passage", "will", "read:", "Men", "cannot", "tell", "us,", "indeed,", "the", "order", "of", "Fate,", "etc.", "'Sele-rædende'", "has", "two", "things", "to", "support", "it:", "(1)", "v.", "1347;", "(2)", "it", "affords", "a", "parallel", "to", "'men'", "in", "v.", "50.", "In", "the", "boroughs", "then", "Beowulf,", "bairn", "of", "the", "Scyldings,", "Belovèd", "land-prince,", "for", "long-lasting", "season", "Was", "famed", "mid", "the", "folk", "(his", "father", "departed,", "The", "prince", "from", "his", "dwelling),", "till", "afterward", "sprang", "Great-minded", "Healfdene;", "the", "Danes", "in", "his", "lifetime", "He", "graciously", "governed,", "grim-mooded,", "agèd."], text: "If that be adopted, the passage will read: Men cannot tell us, indeed, the order of Fate, etc. 'Sele-rædende' has two things to support it: (1) v. 1347; (2) it affords a parallel to 'men' in v. 50. In the boroughs then Beowulf, bairn of the Scyldings, Belovèd land-prince, for long-lasting season Was famed mid the folk (his father departed, The prince from his dwelling), till afterward sprang Great-minded Healfdene; the Danes in his lifetime He graciously governed, grim-mooded, agèd." },
+  { words: ["Four", "bairns", "of", "his", "body", "born", "in", "succession", "Woke", "in", "the", "world,", "war-troopers'", "leader", "Heorogar,", "Hrothgar,", "and", "Halga", "the", "good;", "Heard", "I", "that", "Elan", "was", "Ongentheow's", "consort,", "The", "well-beloved", "bedmate", "of", "the", "War-Scylfing", "leader."], text: "Four bairns of his body born in succession Woke in the world, war-troopers' leader Heorogar, Hrothgar, and Halga the good; Heard I that Elan was Ongentheow's consort, The well-beloved bedmate of the War-Scylfing leader." },
+  { words: ["Then", "glory", "in", "battle", "to", "Hrothgar", "was", "given,", "Waxing", "of", "war-fame,", "that", "willingly", "kinsmen", "Obeyed", "his", "bidding,", "till", "the", "boys", "grew", "to", "manhood,", "A", "numerous", "band."], text: "Then glory in battle to Hrothgar was given, Waxing of war-fame, that willingly kinsmen Obeyed his bidding, till the boys grew to manhood, A numerous band." },
+  { words: ["It", "burned", "in", "his", "spirit", "To", "urge", "his", "folk", "to", "found", "a", "great", "building,", "A", "mead-hall", "grander", "than", "men", "of", "the", "era", "Ever", "had", "heard", "of,", "and", "in", "it", "to", "share", "With", "young", "and", "old", "all", "of", "the", "blessings", "The", "Lord", "had", "allowed", "him,", "save", "life", "and", "retainers."], text: "It burned in his spirit To urge his folk to found a great building, A mead-hall grander than men of the era Ever had heard of, and in it to share With young and old all of the blessings The Lord had allowed him, save life and retainers." },
+  { words: ["Then", "the", "work", "I", "find", "afar", "was", "assigned", "To", "many", "races", "in", "middle-earth's", "regions,", "To", "adorn", "the", "great", "folk-hall."], text: "Then the work I find afar was assigned To many races in middle-earth's regions, To adorn the great folk-hall." },
+  { words: ["In", "due", "time", "it", "happened", "Early", "'mong", "men,", "that", "'twas", "finished", "entirely,", "The", "greatest", "of", "hall-buildings;", "Heorot", "he", "named", "it", "Who", "wide-reaching", "word-sway", "wielded", "'mong", "earlmen."], text: "In due time it happened Early 'mong men, that 'twas finished entirely, The greatest of hall-buildings; Heorot he named it Who wide-reaching word-sway wielded 'mong earlmen." },
+  { words: ["His", "promise", "he", "brake", "not,", "rings", "he", "lavished,", "Treasure", "at", "banquet."], text: "His promise he brake not, rings he lavished, Treasure at banquet." },
+  { words: ["Towered", "the", "hall", "up", "High", "and", "horn-crested,", "huge", "between", "antlers:", "It", "battle-waves", "bided,", "the", "blasting", "fire-demon;", "Ere", "long", "then", "from", "hottest", "hatred", "must", "sword-wrath", "Arise", "for", "a", "woman's", "husband", "and", "father."], text: "Towered the hall up High and horn-crested, huge between antlers: It battle-waves bided, the blasting fire-demon; Ere long then from hottest hatred must sword-wrath Arise for a woman's husband and father." },
+  { words: ["Then", "the", "mighty", "war-spirit", "endured", "for", "a", "season,", "Bore", "it", "bitterly,", "he", "who", "bided", "in", "darkness,", "That", "light-hearted", "laughter", "loud", "in", "the", "building", "Greeted", "him", "daily;", "there", "was", "dulcet", "harp-music,", "Clear", "song", "of", "the", "singer."], text: "Then the mighty war-spirit endured for a season, Bore it bitterly, he who bided in darkness, That light-hearted laughter loud in the building Greeted him daily; there was dulcet harp-music, Clear song of the singer." },
+  { words: ["He", "said", "that", "was", "able", "To", "tell", "from", "of", "old", "earthmen's", "beginnings,", "That", "Father", "Almighty", "earth", "had", "created,", "The", "winsome", "wold", "that", "the", "water", "encircleth,", "Set", "exultingly", "the", "sun's", "and", "the", "moon's", "beams", "To", "lavish", "their", "lustre", "on", "land-folk", "and", "races,", "And", "earth", "He", "embellished", "in", "all", "her", "regions", "With", "limbs", "and", "leaves;", "life", "He", "bestowed", "too", "On", "all", "the", "kindreds", "that", "live", "under", "heaven."], text: "He said that was able To tell from of old earthmen's beginnings, That Father Almighty earth had created, The winsome wold that the water encircleth, Set exultingly the sun's and the moon's beams To lavish their lustre on land-folk and races, And earth He embellished in all her regions With limbs and leaves; life He bestowed too On all the kindreds that live under heaven." },
+  { words: ["So", "blessed", "with", "abundance,", "brimming", "with", "joyance,", "The", "warriors", "abided,", "till", "a", "certain", "one", "gan", "to", "Dog", "them", "with", "deeds", "of", "direfullest", "malice,", "A", "foe", "in", "the", "hall-building:", "this", "horrible", "stranger", "Was", "Grendel", "entitled,", "the", "march-stepper", "famous", "Who", "dwelt", "in", "the", "moor-fens,", "the", "marsh", "and", "the", "fastness;", "The", "wan-mooded", "being", "abode", "for", "a", "season", "In", "the", "land", "of", "the", "giants,", "when", "the", "Lord", "and", "Creator", "Had", "banned", "him", "and", "branded."], text: "So blessed with abundance, brimming with joyance, The warriors abided, till a certain one gan to Dog them with deeds of direfullest malice, A foe in the hall-building: this horrible stranger Was Grendel entitled, the march-stepper famous Who dwelt in the moor-fens, the marsh and the fastness; The wan-mooded being abode for a season In the land of the giants, when the Lord and Creator Had banned him and branded." },
+  { words: ["For", "that", "bitter", "murder,", "The", "killing", "of", "Abel,", "all-ruling", "Father", "The", "kindred", "of", "Cain", "crushed", "with", "His", "vengeance;", "In", "the", "feud", "He", "rejoiced", "not,", "but", "far", "away", "drove", "him", "From", "kindred", "and", "kind,", "that", "crime", "to", "atone", "for,", "Meter", "of", "Justice."], text: "For that bitter murder, The killing of Abel, all-ruling Father The kindred of Cain crushed with His vengeance; In the feud He rejoiced not, but far away drove him From kindred and kind, that crime to atone for, Meter of Justice." },
+  { words: ["Thence", "ill-favored", "creatures,", "Elves", "and", "giants,", "monsters", "of", "ocean,", "Came", "into", "being,", "and", "the", "giants", "that", "longtime", "Grappled", "with", "God;", "He", "gave", "them", "requital."], text: "Thence ill-favored creatures, Elves and giants, monsters of ocean, Came into being, and the giants that longtime Grappled with God; He gave them requital." },
+  { words: ["R.", "and", "t.", "B.", "prefer", "'ellor-gæst'", "to", "'ellen-gæst'", "(86):", "Then", "the", "stranger", "from", "afar", "endured,", "etc.", "Some", "authorities", "would", "translate", "'demon'", "instead", "of", "'stranger.'"], text: "R. and t. B. prefer 'ellor-gæst' to 'ellen-gæst' (86): Then the stranger from afar endured, etc. Some authorities would translate 'demon' instead of 'stranger.'" },
+  { words: ["Some", "authorities", "arrange", "differently,", "and", "render:", "Who", "dwelt", "in", "the", "moor-fens,", "the", "marsh", "and", "the", "fastness,", "the", "land", "of", "the", "giant-race."], text: "Some authorities arrange differently, and render: Who dwelt in the moor-fens, the marsh and the fastness, the land of the giant-race." },
+  { words: ["When", "the", "sun", "was", "sunken,", "he", "set", "out", "to", "visit", "The", "lofty", "hall-building,", "how", "the", "Ring-Danes", "had", "used", "it", "For", "beds", "and", "benches", "when", "the", "banquet", "was", "over."], text: "When the sun was sunken, he set out to visit The lofty hall-building, how the Ring-Danes had used it For beds and benches when the banquet was over." },
+  { words: ["Then", "he", "found", "there", "reposing", "many", "a", "noble", "Asleep", "after", "supper;", "sorrow", "the", "heroes,", "Misery", "knew", "not."], text: "Then he found there reposing many a noble Asleep after supper; sorrow the heroes, Misery knew not." },
+  { words: ["The", "monster", "of", "evil", "Greedy", "and", "cruel", "tarried", "but", "little,", "Fell", "and", "frantic,", "and", "forced", "from", "their", "slumbers", "Thirty", "of", "thanemen;", "thence", "he", "departed", "Leaping", "and", "laughing,", "his", "lair", "to", "return", "to,", "With", "surfeit", "of", "slaughter", "sallying", "homeward."], text: "The monster of evil Greedy and cruel tarried but little, Fell and frantic, and forced from their slumbers Thirty of thanemen; thence he departed Leaping and laughing, his lair to return to, With surfeit of slaughter sallying homeward." },
+  { words: ["In", "the", "dusk", "of", "the", "dawning,", "as", "the", "day", "was", "just", "breaking,", "Was", "Grendel's", "prowess", "revealed", "to", "the", "warriors:", "Then,", "his", "meal-taking", "finished,", "a", "moan", "was", "uplifted,", "Morning-cry", "mighty."], text: "In the dusk of the dawning, as the day was just breaking, Was Grendel's prowess revealed to the warriors: Then, his meal-taking finished, a moan was uplifted, Morning-cry mighty." },
+  { words: ["The", "man-ruler", "famous,", "The", "long-worthy", "atheling,", "sat", "very", "woful,", "Suffered", "great", "sorrow,", "sighed", "for", "his", "liegemen,", "When", "they", "had", "seen", "the", "track", "of", "the", "hateful", "pursuer,", "The", "spirit", "accursèd:", "too", "crushing", "that", "sorrow,", "Too", "loathsome", "and", "lasting."], text: "The man-ruler famous, The long-worthy atheling, sat very woful, Suffered great sorrow, sighed for his liegemen, When they had seen the track of the hateful pursuer, The spirit accursèd: too crushing that sorrow, Too loathsome and lasting." },
+  { words: ["Not", "longer", "he", "tarried,", "But", "one", "night", "after", "continued", "his", "slaughter", "Shameless", "and", "shocking,", "shrinking", "but", "little", "From", "malice", "and", "murder;", "they", "mastered", "him", "fully."], text: "Not longer he tarried, But one night after continued his slaughter Shameless and shocking, shrinking but little From malice and murder; they mastered him fully." },
+  { words: ["He", "was", "easy", "to", "find", "then", "who", "otherwhere", "looked", "for", "A", "pleasanter", "place", "of", "repose", "in", "the", "lodges,", "A", "bed", "in", "the", "bowers."], text: "He was easy to find then who otherwhere looked for A pleasanter place of repose in the lodges, A bed in the bowers." },
+  { words: ["Then", "was", "brought", "to", "his", "notice", "Told", "him", "truly", "by", "token", "apparent", "The", "hall-thane's", "hatred:", "he", "held", "himself", "after", "Further", "and", "faster", "who", "the", "foeman", "did", "baffle."], text: "Then was brought to his notice Told him truly by token apparent The hall-thane's hatred: he held himself after Further and faster who the foeman did baffle." },
+  { words: ["So", "ruled", "he", "and", "strongly", "strove", "against", "justice", "Lone", "against", "all", "men,", "till", "empty", "uptowered", "The", "choicest", "of", "houses."], text: "So ruled he and strongly strove against justice Lone against all men, till empty uptowered The choicest of houses." },
+  { words: ["Long", "was", "the", "season:", "Twelve-winters'", "time", "torture", "suffered", "The", "friend", "of", "the", "Scyldings,", "every", "affliction,", "Endless", "agony;", "hence", "it", "after", "became", "Certainly", "known", "to", "the", "children", "of", "men", "Sadly", "in", "measures,", "that", "long", "against", "Hrothgar", "Grendel", "struggled:--his", "grudges", "he", "cherished,", "Murderous", "malice,", "many", "a", "winter,", "Strife", "unremitting,", "and", "peacefully", "wished", "he", "Life-woe", "to", "lift", "from", "no", "liegeman", "at", "all", "of", "The", "men", "of", "the", "Dane-folk,", "for", "money", "to", "settle,", "No", "counsellor", "needed", "count", "for", "a", "moment", "On", "handsome", "amends", "at", "the", "hands", "of", "the", "murderer;", "The", "monster", "of", "evil", "fiercely", "did", "harass,", "The", "ill-planning", "death-shade,", "both", "elder", "and", "younger,", "Trapping", "and", "tricking", "them."], text: "Long was the season: Twelve-winters' time torture suffered The friend of the Scyldings, every affliction, Endless agony; hence it after became Certainly known to the children of men Sadly in measures, that long against Hrothgar Grendel struggled:--his grudges he cherished, Murderous malice, many a winter, Strife unremitting, and peacefully wished he Life-woe to lift from no liegeman at all of The men of the Dane-folk, for money to settle, No counsellor needed count for a moment On handsome amends at the hands of the murderer; The monster of evil fiercely did harass, The ill-planning death-shade, both elder and younger, Trapping and tricking them." },
+  { words: ["He", "trod", "every", "night", "then", "The", "mist-covered", "moor-fens;", "men", "do", "not", "know", "where", "Witches", "and", "wizards", "wander", "and", "ramble."], text: "He trod every night then The mist-covered moor-fens; men do not know where Witches and wizards wander and ramble." },
+  { words: ["So", "the", "foe", "of", "mankind", "many", "of", "evils", "Grievous", "injuries,", "often", "accomplished,", "Horrible", "hermit;", "Heort", "he", "frequented,", "Gem-bedecked", "palace,", "when", "night-shades", "had", "fallen", "(Since", "God", "did", "oppose", "him,", "not", "the", "throne", "could", "he", "touch,", "The", "light-flashing", "jewel,", "love", "of", "Him", "knew", "not)."], text: "So the foe of mankind many of evils Grievous injuries, often accomplished, Horrible hermit; Heort he frequented, Gem-bedecked palace, when night-shades had fallen (Since God did oppose him, not the throne could he touch, The light-flashing jewel, love of Him knew not)." },
+  { words: ["'Twas", "a", "fearful", "affliction", "to", "the", "friend", "of", "the", "Scyldings", "Soul-crushing", "sorrow."], text: "'Twas a fearful affliction to the friend of the Scyldings Soul-crushing sorrow." },
+  { words: ["Not", "seldom", "in", "private", "Sat", "the", "king", "in", "his", "council;", "conference", "held", "they", "What", "the", "braves", "should", "determine", "'gainst", "terrors", "unlooked", "for."], text: "Not seldom in private Sat the king in his council; conference held they What the braves should determine 'gainst terrors unlooked for." },
+  { words: ["At", "the", "shrines", "of", "their", "idols", "often", "they", "promised", "Gifts", "and", "offerings,", "earnestly", "prayed", "they", "The", "devil", "from", "hell", "would", "help", "them", "to", "lighten", "Their", "people's", "oppression."], text: "At the shrines of their idols often they promised Gifts and offerings, earnestly prayed they The devil from hell would help them to lighten Their people's oppression." },
+  { words: ["Such", "practice", "they", "used", "then,", "Hope", "of", "the", "heathen;", "hell", "they", "remembered", "In", "innermost", "spirit,", "God", "they", "knew", "not,", "Judge", "of", "their", "actions,", "All-wielding", "Ruler,", "No", "praise", "could", "they", "give", "the", "Guardian", "of", "Heaven,", "The", "Wielder", "of", "Glory."], text: "Such practice they used then, Hope of the heathen; hell they remembered In innermost spirit, God they knew not, Judge of their actions, All-wielding Ruler, No praise could they give the Guardian of Heaven, The Wielder of Glory." },
+  { words: ["Woe", "will", "be", "his", "who", "Through", "furious", "hatred", "his", "spirit", "shall", "drive", "to", "The", "clutch", "of", "the", "fire,", "no", "comfort", "shall", "look", "for,", "Wax", "no", "wiser;", "well", "for", "the", "man", "who,", "Living", "his", "life-days,", "his", "Lord", "may", "face", "And", "find", "defence", "in", "his", "Father's", "embrace!"], text: "Woe will be his who Through furious hatred his spirit shall drive to The clutch of the fire, no comfort shall look for, Wax no wiser; well for the man who, Living his life-days, his Lord may face And find defence in his Father's embrace!" },
+  { words: ["The", "translation", "is", "based", "on", "'weras,'", "adopted", "by", "H.-So.--K.", "and", "Th.", "read", "'wera'", "and,", "arranging", "differently,", "render", "119(2)-120:", "They", "knew", "not", "sorrow,", "the", "wretchedness", "of", "man,", "aught", "of", "misfortune.--For", "'unhælo'", "(120)", "R.", "suggests", "'unfælo':", "The", "uncanny", "creature,", "greedy", "and", "cruel,", "etc.", "S.", "rearranges", "and", "translates:", "So", "he", "ruled", "and", "struggled", "unjustly,", "one", "against", "all,", "till", "the", "noblest", "of", "buildings", "stood", "useless", "(it", "was", "a", "long", "while)", "twelve", "years'", "time:", "the", "friend", "of", "the", "Scyldings", "suffered", "distress,", "every", "woe,", "great", "sorrows,", "etc.", "For", "'syððan,'", "B.", "suggests", "'sárcwidum':", "Hence", "in", "mournful", "words", "it", "became", "well", "known,", "etc.", "Various", "other", "words", "beginning", "with", "'s'", "have", "been", "conjectured."], text: "The translation is based on 'weras,' adopted by H.-So.--K. and Th. read 'wera' and, arranging differently, render 119(2)-120: They knew not sorrow, the wretchedness of man, aught of misfortune.--For 'unhælo' (120) R. suggests 'unfælo': The uncanny creature, greedy and cruel, etc. S. rearranges and translates: So he ruled and struggled unjustly, one against all, till the noblest of buildings stood useless (it was a long while) twelve years' time: the friend of the Scyldings suffered distress, every woe, great sorrows, etc. For 'syððan,' B. suggests 'sárcwidum': Hence in mournful words it became well known, etc. Various other words beginning with 's' have been conjectured." },
+  { words: ["The", "H.-So.", "glossary", "is", "very", "inconsistent", "in", "referring", "to", "this", "passage.--'Sibbe'", "(154),", "which", "H.-So.", "regards", "as", "an", "instr.,", "B.", "takes", "as", "accus.,", "obj.", "of", "'wolde.'"], text: "The H.-So. glossary is very inconsistent in referring to this passage.--'Sibbe' (154), which H.-So. regards as an instr., B. takes as accus., obj. of 'wolde.'" },
+  { words: ["Putting", "a", "comma", "after", "Deniga,", "he", "renders:", "He", "did", "not", "desire", "peace", "with", "any", "of", "the", "Danes,", "nor", "did", "he", "wish", "to", "remove", "their", "life-woe,", "nor", "to", "settle", "for", "money."], text: "Putting a comma after Deniga, he renders: He did not desire peace with any of the Danes, nor did he wish to remove their life-woe, nor to settle for money." },
+  { words: ["Of", "this", "difficult", "passage", "the", "following", "interpretations", "among", "others", "are", "given:", "(1)", "Though", "Grendel", "has", "frequented", "Heorot", "as", "a", "demon,", "he", "could", "not", "become", "ruler", "of", "the", "Danes,", "on", "account", "of", "his", "hostility", "to", "God."], text: "Of this difficult passage the following interpretations among others are given: (1) Though Grendel has frequented Heorot as a demon, he could not become ruler of the Danes, on account of his hostility to God." },
+  { words: ["(2)", "Hrothgar", "was", "much", "grieved", "that", "Grendel", "had", "not", "appeared", "before", "his", "throne", "to", "receive", "presents."], text: "(2) Hrothgar was much grieved that Grendel had not appeared before his throne to receive presents." },
+  { words: ["(3)", "He", "was", "not", "permitted", "to", "devastate", "the", "hall,", "on", "account", "of", "the", "Creator;", "i.e."], text: "(3) He was not permitted to devastate the hall, on account of the Creator; i.e." },
+  { words: ["God", "wished", "to", "make", "his", "visit", "fatal", "to", "him.--Ne", "...", "wisse", "(169)", "W.", "renders:", "Nor", "had", "he", "any", "desire", "to", "do", "so;", "'his'", "being", "obj.", "gen.", "=", "danach."], text: "God wished to make his visit fatal to him.--Ne ... wisse (169) W. renders: Nor had he any desire to do so; 'his' being obj. gen. = danach." },
+  { words: ["So", "Healfdene's", "kinsman", "constantly", "mused", "on", "His", "long-lasting", "sorrow;", "the", "battle-thane", "clever", "Was", "not", "anywise", "able", "evils", "to", "'scape", "from:", "Too", "crushing", "the", "sorrow", "that", "came", "to", "the", "people,", "Loathsome", "and", "lasting", "the", "life-grinding", "torture,", "Greatest", "of", "night-woes."], text: "So Healfdene's kinsman constantly mused on His long-lasting sorrow; the battle-thane clever Was not anywise able evils to 'scape from: Too crushing the sorrow that came to the people, Loathsome and lasting the life-grinding torture, Greatest of night-woes." },
+  { words: ["So", "Higelac's", "liegeman,", "Good", "amid", "Geatmen,", "of", "Grendel's", "achievements", "Heard", "in", "his", "home:", "of", "heroes", "then", "living", "He", "was", "stoutest", "and", "strongest,", "sturdy", "and", "noble."], text: "So Higelac's liegeman, Good amid Geatmen, of Grendel's achievements Heard in his home: of heroes then living He was stoutest and strongest, sturdy and noble." },
+  { words: ["He", "bade", "them", "prepare", "him", "a", "bark", "that", "was", "trusty;", "He", "said", "he", "the", "war-king", "would", "seek", "o'er", "the", "ocean,", "The", "folk-leader", "noble,", "since", "he", "needed", "retainers."], text: "He bade them prepare him a bark that was trusty; He said he the war-king would seek o'er the ocean, The folk-leader noble, since he needed retainers." },
+  { words: ["For", "the", "perilous", "project", "prudent", "companions", "Chided", "him", "little,", "though", "loving", "him", "dearly;", "They", "egged", "the", "brave", "atheling,", "augured", "him", "glory."], text: "For the perilous project prudent companions Chided him little, though loving him dearly; They egged the brave atheling, augured him glory." },
+  { words: ["The", "excellent", "knight", "from", "the", "folk", "of", "the", "Geatmen", "Had", "liegemen", "selected,", "likest", "to", "prove", "them", "Trustworthy", "warriors;", "with", "fourteen", "companions", "The", "vessel", "he", "looked", "for;", "a", "liegeman", "then", "showed", "them,", "A", "sea-crafty", "man,", "the", "bounds", "of", "the", "country."], text: "The excellent knight from the folk of the Geatmen Had liegemen selected, likest to prove them Trustworthy warriors; with fourteen companions The vessel he looked for; a liegeman then showed them, A sea-crafty man, the bounds of the country." },
+  { words: ["Fast", "the", "days", "fleeted;", "the", "float", "was", "a-water,", "The", "craft", "by", "the", "cliff."], text: "Fast the days fleeted; the float was a-water, The craft by the cliff." },
+  { words: ["Clomb", "to", "the", "prow", "then", "Well-equipped", "warriors:", "the", "wave-currents", "twisted", "The", "sea", "on", "the", "sand;", "soldiers", "then", "carried", "On", "the", "breast", "of", "the", "vessel", "bright-shining", "jewels,", "Handsome", "war-armor;", "heroes", "outshoved", "then,", "Warmen", "the", "wood-ship,", "on", "its", "wished-for", "adventure."], text: "Clomb to the prow then Well-equipped warriors: the wave-currents twisted The sea on the sand; soldiers then carried On the breast of the vessel bright-shining jewels, Handsome war-armor; heroes outshoved then, Warmen the wood-ship, on its wished-for adventure." },
+  { words: ["The", "foamy-necked", "floater", "fanned", "by", "the", "breeze,", "Likest", "a", "bird,", "glided", "the", "waters,", "Till", "twenty", "and", "four", "hours", "thereafter", "The", "twist-stemmed", "vessel", "had", "traveled", "such", "distance", "That", "the", "sailing-men", "saw", "the", "sloping", "embankments,", "The", "sea", "cliffs", "gleaming,", "precipitous", "mountains,", "Nesses", "enormous:", "they", "were", "nearing", "the", "limits", "At", "the", "end", "of", "the", "ocean."], text: "The foamy-necked floater fanned by the breeze, Likest a bird, glided the waters, Till twenty and four hours thereafter The twist-stemmed vessel had traveled such distance That the sailing-men saw the sloping embankments, The sea cliffs gleaming, precipitous mountains, Nesses enormous: they were nearing the limits At the end of the ocean." },
+  { words: ["Up", "thence", "quickly", "The", "men", "of", "the", "Weders", "clomb", "to", "the", "mainland,", "Fastened", "their", "vessel", "(battle", "weeds", "rattled,", "War", "burnies", "clattered),", "the", "Wielder", "they", "thanked", "That", "the", "ways", "o'er", "the", "waters", "had", "waxen", "so", "gentle."], text: "Up thence quickly The men of the Weders clomb to the mainland, Fastened their vessel (battle weeds rattled, War burnies clattered), the Wielder they thanked That the ways o'er the waters had waxen so gentle." },
+  { words: ["Then", "well", "from", "the", "cliff", "edge", "the", "guard", "of", "the", "Scyldings", "Who", "the", "sea-cliffs", "should", "see", "to,", "saw", "o'er", "the", "gangway", "Brave", "ones", "bearing", "beauteous", "targets,", "Armor", "all", "ready,", "anxiously", "thought", "he,", "Musing", "and", "wondering", "what", "men", "were", "approaching."], text: "Then well from the cliff edge the guard of the Scyldings Who the sea-cliffs should see to, saw o'er the gangway Brave ones bearing beauteous targets, Armor all ready, anxiously thought he, Musing and wondering what men were approaching." },
+  { words: ["High", "on", "his", "horse", "then", "Hrothgar's", "retainer", "Turned", "him", "to", "coastward,", "mightily", "brandished", "His", "lance", "in", "his", "hands,", "questioned", "with", "boldness."], text: "High on his horse then Hrothgar's retainer Turned him to coastward, mightily brandished His lance in his hands, questioned with boldness." },
+  { words: ['"Who', "are", "ye", "men", "here,", "mail-covered", "warriors", "Clad", "in", "your", "corslets,", "come", "thus", "a-driving", "A", "high", "riding", "ship", "o'er", "the", "shoals", "of", "the", "waters,", "And", "hither", "'neath", "helmets", "have", "hied", "o'er", "the", "ocean?"], text: `"Who are ye men here, mail-covered warriors Clad in your corslets, come thus a-driving A high riding ship o'er the shoals of the waters, And hither 'neath helmets have hied o'er the ocean?` },
+  { words: ["I", "have", "been", "strand-guard,", "standing", "as", "warden,", "Lest", "enemies", "ever", "anywise", "ravage", "Danish", "dominions", "with", "army", "of", "war-ships."], text: "I have been strand-guard, standing as warden, Lest enemies ever anywise ravage Danish dominions with army of war-ships." },
+  { words: ["More", "boldly", "never", "have", "warriors", "ventured", "Hither", "to", "come;", "of", "kinsmen's", "approval,", "Word-leave", "of", "warriors,", "I", "ween", "that", "ye", "surely", "Nothing", "have", "known."], text: "More boldly never have warriors ventured Hither to come; of kinsmen's approval, Word-leave of warriors, I ween that ye surely Nothing have known." },
+  { words: ["Never", "a", "greater", "one", "Of", "earls", "o'er", "the", "earth", "have", "I", "had", "a", "sight", "of", "Than", "is", "one", "of", "your", "number,", "a", "hero", "in", "armor;", "No", "low-ranking", "fellow", "adorned", "with", "his", "weapons,", "But", "launching", "them", "little,", "unless", "looks", "are", "deceiving,", "And", "striking", "appearance."], text: "Never a greater one Of earls o'er the earth have I had a sight of Than is one of your number, a hero in armor; No low-ranking fellow adorned with his weapons, But launching them little, unless looks are deceiving, And striking appearance." },
+  { words: ["Ere", "ye", "pass", "on", "your", "journey", "As", "treacherous", "spies", "to", "the", "land", "of", "the", "Scyldings", "And", "farther", "fare,", "I", "fully", "must", "know", "now", "What", "race", "ye", "belong", "to."], text: "Ere ye pass on your journey As treacherous spies to the land of the Scyldings And farther fare, I fully must know now What race ye belong to." },
+  { words: ["Ye", "far-away", "dwellers,", "Sea-faring", "sailors,", "my", "simple", "opinion", "Hear", "ye", "and", "hearken:", "haste", "is", "most", "fitting", "Plainly", "to", "tell", "me", "what", "place", "ye", "are", "come", 'from."'], text: 'Ye far-away dwellers, Sea-faring sailors, my simple opinion Hear ye and hearken: haste is most fitting Plainly to tell me what place ye are come from."' },
+  { words: ["'From", "hám'", "(194)", "is", "much", "disputed."], text: "'From hám' (194) is much disputed." },
+  { words: ["One", "rendering", "is:", "Beowulf,", "being", "away", "from", "home,", "heard", "of", "Hrothgar's", "troubles,", "etc.", "Another,", "that", "adopted", "by", "S.", "and", "endorsed", "in", "the", "H.-So.", "notes,", "is:", "B.", "heard", "from", "his", "neighborhood", "(neighbors),", "i.e.", "in", "his", "home,", "etc.", "A", "third", "is:", "B.,", "being", "at", "home,", "heard", "this", "as", "occurring", "away", "from", "home."], text: "One rendering is: Beowulf, being away from home, heard of Hrothgar's troubles, etc. Another, that adopted by S. and endorsed in the H.-So. notes, is: B. heard from his neighborhood (neighbors), i.e. in his home, etc. A third is: B., being at home, heard this as occurring away from home." },
+  { words: ["The", "H.-So.", "glossary", "and", "notes", "conflict."], text: "The H.-So. glossary and notes conflict." },
+  { words: ["'Eoletes'", "(224)", "is", "marked", "with", "a", "(?)", "by", "H.-So.;", "our", "rendering", "simply", "follows", "his", "conjecture.--Other", "conjectures", "as", "to", "'eolet'", "are:", "(1)", "voyage,", "(2)", "toil,", "labor,", "(3)", "hasty", "journey."], text: "'Eoletes' (224) is marked with a (?) by H.-So.; our rendering simply follows his conjecture.--Other conjectures as to 'eolet' are: (1) voyage, (2) toil, labor, (3) hasty journey." },
+  { words: ["The", "lacuna", "of", "the", "MS", "at", "this", "point", "has", "been", "supplied", "by", "various", "conjectures."], text: "The lacuna of the MS at this point has been supplied by various conjectures." },
+  { words: ["The", "reading", "adopted", "by", "H.-So.", "has", "been", "rendered", "in", "the", "above", "translation."], text: "The reading adopted by H.-So. has been rendered in the above translation." },
+  { words: ["W.,", "like", "H.-So.,", "makes", "'ic'", "the", "beginning", "of", "a", "new", "sentence,", "but,", "for", "'helmas", "bæron,'", "he", "reads", "'hringed", "stefnan.'"], text: "W., like H.-So., makes 'ic' the beginning of a new sentence, but, for 'helmas bæron,' he reads 'hringed stefnan.'" },
+  { words: ["This", "has", "the", "advantage", "of", "giving", "a", "parallel", "to", "'brontne", "ceol'", "instead", "of", "a", "kenning", "for", "'go.'--B", "puts", "the", "(?)", "after", "'holmas',", "and", "begins", "a", "new", "sentence", "at", "the", "middle", "of", "the", "line."], text: "This has the advantage of giving a parallel to 'brontne ceol' instead of a kenning for 'go.'--B puts the (?) after 'holmas', and begins a new sentence at the middle of the line." },
+  { words: ["Translate:", "What", "warriors", "are", "ye,", "clad", "in", "armor,", "who", "have", "thus", "come", "bringing", "the", "foaming", "vessel", "over", "the", "water", "way,", "hither", "over", "the", "seas?"], text: "Translate: What warriors are ye, clad in armor, who have thus come bringing the foaming vessel over the water way, hither over the seas?" },
+  { words: ["For", "some", "time", "on", "the", "wall", "I", "have", "been", "coast", "guard,", "etc.", "S.", "endorses", "most", "of", "what", "B.", "says,", "but", "leaves", "out", "'on", "the", "wall'", "in", "the", "last", "sentence."], text: "For some time on the wall I have been coast guard, etc. S. endorses most of what B. says, but leaves out 'on the wall' in the last sentence." },
+  { words: ["If", "W.'s", "'hringed", "stefnan'", "be", "accepted,", "change", "line", "51", "above", "to,", "A", "ring-stemmed", "vessel", "hither", "o'ersea."], text: "If W.'s 'hringed stefnan' be accepted, change line 51 above to, A ring-stemmed vessel hither o'ersea." },
+  { words: ["'Seld-guma'", "(249)", "is", "variously", "rendered:", "(1)", "housecarle;", "(2)", "home-stayer;", "(3)", "common", "man."], text: "'Seld-guma' (249) is variously rendered: (1) housecarle; (2) home-stayer; (3) common man." },
+  { words: ["Dr.", "H.", "Wood", "suggests", "a", "man-at-arms", "in", "another's", "house."], text: "Dr. H. Wood suggests a man-at-arms in another's house." },
+  { words: ["The", "chief", "of", "the", "strangers", "rendered", "him", "answer,", "War-troopers'", "leader,", "and", "word-treasure", "opened:", '"We', "are", "sprung", "from", "the", "lineage", "of", "the", "people", "of", "Geatland,", "And", "Higelac's", "hearth-friends."], text: `The chief of the strangers rendered him answer, War-troopers' leader, and word-treasure opened: "We are sprung from the lineage of the people of Geatland, And Higelac's hearth-friends.` },
+  { words: ["To", "heroes", "unnumbered", "My", "father", "was", "known,", "a", "noble", "head-warrior", "Ecgtheow", "titled;", "many", "a", "winter", "He", "lived", "with", "the", "people,", "ere", "he", "passed", "on", "his", "journey,", "Old", "from", "his", "dwelling;", "each", "of", "the", "counsellors", "Widely", "mid", "world-folk", "well", "remembers", "him."], text: "To heroes unnumbered My father was known, a noble head-warrior Ecgtheow titled; many a winter He lived with the people, ere he passed on his journey, Old from his dwelling; each of the counsellors Widely mid world-folk well remembers him." },
+  { words: ["We,", "kindly", "of", "spirit,", "the", "lord", "of", "thy", "people,", "The", "son", "of", "King", "Healfdene,", "have", "come", "here", "to", "visit,", "Folk-troop's", "defender:", "be", "free", "in", "thy", "counsels!"], text: "We, kindly of spirit, the lord of thy people, The son of King Healfdene, have come here to visit, Folk-troop's defender: be free in thy counsels!" },
+  { words: ["To", "the", "noble", "one", "bear", "we", "a", "weighty", "commission,", "The", "helm", "of", "the", "Danemen;", "we", "shall", "hide,", "I", "ween,", "Naught", "of", "our", "message."], text: "To the noble one bear we a weighty commission, The helm of the Danemen; we shall hide, I ween, Naught of our message." },
+  { words: ["Thou", "know'st", "if", "it", "happen,", "As", "we", "soothly", "heard", "say,", "that", "some", "savage", "despoiler,", "Some", "hidden", "pursuer,", "on", "nights", "that", "are", "murky", "By", "deeds", "very", "direful", "'mid", "the", "Danemen", "exhibits", "Hatred", "unheard", "of,", "horrid", "destruction", "And", "the", "falling", "of", "dead."], text: "Thou know'st if it happen, As we soothly heard say, that some savage despoiler, Some hidden pursuer, on nights that are murky By deeds very direful 'mid the Danemen exhibits Hatred unheard of, horrid destruction And the falling of dead." },
+  { words: ["From", "feelings", "least", "selfish", "I", "am", "able", "to", "render", "counsel", "to", "Hrothgar,", "How", "he,", "wise", "and", "worthy,", "may", "worst", "the", "destroyer,", "If", "the", "anguish", "of", "sorrow", "should", "ever", "be", "lessened,", "Comfort", "come", "to", "him,", "and", "care-waves", "grow", "cooler,", "Or", "ever", "hereafter", "he", "agony", "suffer", "And", "troublous", "distress,", "while", "towereth", "upward", "The", "handsomest", "of", "houses", "high", "on", "the", 'summit."'], text: 'From feelings least selfish I am able to render counsel to Hrothgar, How he, wise and worthy, may worst the destroyer, If the anguish of sorrow should ever be lessened, Comfort come to him, and care-waves grow cooler, Or ever hereafter he agony suffer And troublous distress, while towereth upward The handsomest of houses high on the summit."' },
+  { words: ["Bestriding", "his", "stallion,", "the", "strand-watchman", "answered,", "The", "doughty", "retainer:", '"The', "difference", "surely", "'Twixt", "words", "and", "works,", "the", "warlike", "shield-bearer", "Who", "judgeth", "wisely", "well", "shall", "determine."], text: `Bestriding his stallion, the strand-watchman answered, The doughty retainer: "The difference surely 'Twixt words and works, the warlike shield-bearer Who judgeth wisely well shall determine.` },
+  { words: ["This", "band,", "I", "hear,", "beareth", "no", "malice", "To", "the", "prince", "of", "the", "Scyldings."], text: "This band, I hear, beareth no malice To the prince of the Scyldings." },
+  { words: ["Pass", "ye", "then", "onward", "With", "weapons", "and", "armor."], text: "Pass ye then onward With weapons and armor." },
+  { words: ["I", "shall", "lead", "you", "in", "person;", "To", "my", "war-trusty", "vassals", "command", "I", "shall", "issue", "To", "keep", "from", "all", "injury", "your", "excellent", "vessel,", "Your", "fresh-tarred", "craft,", "'gainst", "every", "opposer", "Close", "by", "the", "sea-shore,", "till", "the", "curved-neckèd", "bark", "shall", "Waft", "back", "again", "the", "well-beloved", "hero", "O'er", "the", "way", "of", "the", "water", "to", "Weder", "dominions."], text: "I shall lead you in person; To my war-trusty vassals command I shall issue To keep from all injury your excellent vessel, Your fresh-tarred craft, 'gainst every opposer Close by the sea-shore, till the curved-neckèd bark shall Waft back again the well-beloved hero O'er the way of the water to Weder dominions." },
+  { words: ["To", "warrior", "so", "great", "'twill", "be", "granted", "sure", "In", "the", "storm", "of", "strife", "to", "stand", 'secure."'], text: `To warrior so great 'twill be granted sure In the storm of strife to stand secure."` },
+  { words: ["Onward", "they", "fared", "then", "(the", "vessel", "lay", "quiet,", "The", "broad-bosomed", "bark", "was", "bound", "by", "its", "cable,", "Firmly", "at", "anchor);", "the", "boar-signs", "glistened", "Bright", "on", "the", "visors", "vivid", "with", "gilding,", "Blaze-hardened,", "brilliant;", "the", "boar", "acted", "warden."], text: "Onward they fared then (the vessel lay quiet, The broad-bosomed bark was bound by its cable, Firmly at anchor); the boar-signs glistened Bright on the visors vivid with gilding, Blaze-hardened, brilliant; the boar acted warden." },
+  { words: ["The", "heroes", "hastened,", "hurried", "the", "liegemen,", "Descended", "together,", "till", "they", "saw", "the", "great", "palace,", "The", "well-fashioned", "wassail-hall", "wondrous", "and", "gleaming:", "'Mid", "world-folk", "and", "kindreds", "that", "was", "widest", "reputed", "Of", "halls", "under", "heaven", "which", "the", "hero", "abode", "in;", "Its", "lustre", "enlightened", "lands", "without", "number."], text: "The heroes hastened, hurried the liegemen, Descended together, till they saw the great palace, The well-fashioned wassail-hall wondrous and gleaming: 'Mid world-folk and kindreds that was widest reputed Of halls under heaven which the hero abode in; Its lustre enlightened lands without number." },
+  { words: ["Then", "the", "battle-brave", "hero", "showed", "them", "the", "glittering", "Court", "of", "the", "bold", "ones,", "that", "they", "easily", "thither", "Might", "fare", "on", "their", "journey;", "the", "aforementioned", "warrior", "Turning", "his", "courser,", "quoth", "as", "he", "left", "them:", `"'Tis`, "time", "I", "were", "faring;", "Father", "Almighty", "Grant", "you", "His", "grace,", "and", "give", "you", "to", "journey", "Safe", "on", "your", "mission!"], text: `Then the battle-brave hero showed them the glittering Court of the bold ones, that they easily thither Might fare on their journey; the aforementioned warrior Turning his courser, quoth as he left them: "'Tis time I were faring; Father Almighty Grant you His grace, and give you to journey Safe on your mission!` },
+  { words: ["To", "the", "sea", "I", "will", "get", "me", "'Gainst", "hostile", "warriors", "as", "warden", "to", 'stand."'], text: `To the sea I will get me 'Gainst hostile warriors as warden to stand."` },
+  { words: ["'Edwendan'", "(280)", "B.", "takes", "to", "be", "the", "subs."], text: "'Edwendan' (280) B. takes to be the subs." },
+  { words: ["'edwenden'", "(cf.", "1775);", "and", "'bisigu'", "he", "takes", "as", "gen.", "sing.,", "limiting", "'edwenden':", "If", "reparation", "for", "sorrows", "is", "ever", "to", "come."], text: "'edwenden' (cf. 1775); and 'bisigu' he takes as gen. sing., limiting 'edwenden': If reparation for sorrows is ever to come." },
+  { words: ["This", "is", "supported", "by", "t.B."], text: "This is supported by t.B." },
+  { words: ["Combining", "the", "emendations", "of", "B.", "and", "t.B.,", "we", "may", "read:", "The", "boar-images", "glistened", "...", "brilliant,", "protected", "the", "life", "of", "the", "war-mooded", "man."], text: "Combining the emendations of B. and t.B., we may read: The boar-images glistened ... brilliant, protected the life of the war-mooded man." },
+  { words: ["They", "read", "'ferh-wearde'", "(305)", "and", "'gúðmódgum", "men'", "(306)."], text: "They read 'ferh-wearde' (305) and 'gúðmódgum men' (306)." },
+  { words: ["The", "highway", "glistened", "with", "many-hued", "pebble,", "A", "by-path", "led", "the", "liegemen", "together."], text: "The highway glistened with many-hued pebble, A by-path led the liegemen together." },
+  { words: ["Firm", "and", "hand-locked", "the", "war-burnie", "glistened,", "The", "ring-sword", "radiant", "rang", "'mid", "the", "armor", "As", "the", "party", "was", "approaching", "the", "palace", "together", "In", "warlike", "equipments."], text: "Firm and hand-locked the war-burnie glistened, The ring-sword radiant rang 'mid the armor As the party was approaching the palace together In warlike equipments." },
+  { words: ["'Gainst", "the", "wall", "of", "the", "building", "Their", "wide-fashioned", "war-shields", "they", "weary", "did", "set", "then,", "Battle-shields", "sturdy;", "benchward", "they", "turned", "then;", "Their", "battle-sarks", "rattled,", "the", "gear", "of", "the", "heroes;", "The", "lances", "stood", "up", "then,", "all", "in", "a", "cluster,", "The", "arms", "of", "the", "seamen,", "ashen-shafts", "mounted", "With", "edges", "of", "iron:", "the", "armor-clad", "troopers", "Were", "decked", "with", "weapons."], text: "'Gainst the wall of the building Their wide-fashioned war-shields they weary did set then, Battle-shields sturdy; benchward they turned then; Their battle-sarks rattled, the gear of the heroes; The lances stood up then, all in a cluster, The arms of the seamen, ashen-shafts mounted With edges of iron: the armor-clad troopers Were decked with weapons." },
+  { words: ["Then", "a", "proud-mooded", "hero", "Asked", "of", "the", "champions", "questions", "of", "lineage:", '"From', "what", "borders", "bear", "ye", "your", "battle-shields", "plated,", "Gilded", "and", "gleaming,", "your", "gray-colored", "burnies,", "Helmets", "with", "visors", "and", "heap", "of", "war-lances?--", "To", "Hrothgar", "the", "king", "I", "am", "servant", "and", "liegeman."], text: 'Then a proud-mooded hero Asked of the champions questions of lineage: "From what borders bear ye your battle-shields plated, Gilded and gleaming, your gray-colored burnies, Helmets with visors and heap of war-lances?-- To Hrothgar the king I am servant and liegeman.' },
+  { words: ["'Mong", "folk", "from", "far-lands", "found", "I", "have", "never", "Men", "so", "many", "of", "mien", "more", "courageous."], text: "'Mong folk from far-lands found I have never Men so many of mien more courageous." }
+];
 var crimeWords = [
-  "I.",
-  "A",
-  "SCANDAL",
-  "IN",
-  "BOHEMIA",
-  "I.",
   "To",
   "Sherlock",
   "Holmes",
   "she",
   "is",
   "always",
-  "_the_",
+  "the",
   "woman.",
   "I",
   "have",
@@ -20328,7 +20763,7 @@ var crimeWords = [
   "I",
   "have",
   "come",
-  "_incognito_",
+  "incognito",
   "from",
   "Prague",
   "for",
@@ -20966,8 +21401,8 @@ var crimeWords = [
   "money?”",
   "“You",
   "have",
-  "_carte",
-  "blanche_.”",
+  "carte",
+  "blanche.”",
   "“Absolutely?”",
   "“I",
   "tell",
@@ -21126,7 +21561,6 @@ var crimeWords = [
   "over",
   "with",
   "you.”",
-  "II.",
   "At",
   "three",
   "o’clock",
@@ -21541,7 +21975,7 @@ var crimeWords = [
   "It",
   "is",
   "a",
-  "_bijou_",
+  "bijou",
   "villa,",
   "with",
   "a",
@@ -21557,6 +21991,282 @@ var crimeWords = [
   "right",
   "up",
   "to"
+];
+var crimeSentences = [
+  { words: ["To", "Sherlock", "Holmes", "she", "is", "always", "the", "woman."], text: "To Sherlock Holmes she is always the woman." },
+  { words: ["I", "have", "seldom", "heard", "him", "mention", "her", "under", "any", "other", "name."], text: "I have seldom heard him mention her under any other name." },
+  { words: ["In", "his", "eyes", "she", "eclipses", "and", "predominates", "the", "whole", "of", "her", "sex."], text: "In his eyes she eclipses and predominates the whole of her sex." },
+  { words: ["It", "was", "not", "that", "he", "felt", "any", "emotion", "akin", "to", "love", "for", "Irene", "Adler."], text: "It was not that he felt any emotion akin to love for Irene Adler." },
+  { words: ["All", "emotions,", "and", "that", "one", "particularly,", "were", "abhorrent", "to", "his", "cold,", "precise", "but", "admirably", "balanced", "mind."], text: "All emotions, and that one particularly, were abhorrent to his cold, precise but admirably balanced mind." },
+  { words: ["He", "was,", "I", "take", "it,", "the", "most", "perfect", "reasoning", "and", "observing", "machine", "that", "the", "world", "has", "seen,", "but", "as", "a", "lover", "he", "would", "have", "placed", "himself", "in", "a", "false", "position."], text: "He was, I take it, the most perfect reasoning and observing machine that the world has seen, but as a lover he would have placed himself in a false position." },
+  { words: ["He", "never", "spoke", "of", "the", "softer", "passions,", "save", "with", "a", "gibe", "and", "a", "sneer."], text: "He never spoke of the softer passions, save with a gibe and a sneer." },
+  { words: ["They", "were", "admirable", "things", "for", "the", "observer—excellent", "for", "drawing", "the", "veil", "from", "men’s", "motives", "and", "actions."], text: "They were admirable things for the observer—excellent for drawing the veil from men’s motives and actions." },
+  { words: ["But", "for", "the", "trained", "reasoner", "to", "admit", "such", "intrusions", "into", "his", "own", "delicate", "and", "finely", "adjusted", "temperament", "was", "to", "introduce", "a", "distracting", "factor", "which", "might", "throw", "a", "doubt", "upon", "all", "his", "mental", "results."], text: "But for the trained reasoner to admit such intrusions into his own delicate and finely adjusted temperament was to introduce a distracting factor which might throw a doubt upon all his mental results." },
+  { words: ["Grit", "in", "a", "sensitive", "instrument,", "or", "a", "crack", "in", "one", "of", "his", "own", "high-power", "lenses,", "would", "not", "be", "more", "disturbing", "than", "a", "strong", "emotion", "in", "a", "nature", "such", "as", "his."], text: "Grit in a sensitive instrument, or a crack in one of his own high-power lenses, would not be more disturbing than a strong emotion in a nature such as his." },
+  { words: ["And", "yet", "there", "was", "but", "one", "woman", "to", "him,", "and", "that", "woman", "was", "the", "late", "Irene", "Adler,", "of", "dubious", "and", "questionable", "memory."], text: "And yet there was but one woman to him, and that woman was the late Irene Adler, of dubious and questionable memory." },
+  { words: ["I", "had", "seen", "little", "of", "Holmes", "lately."], text: "I had seen little of Holmes lately." },
+  { words: ["My", "marriage", "had", "drifted", "us", "away", "from", "each", "other."], text: "My marriage had drifted us away from each other." },
+  { words: ["My", "own", "complete", "happiness,", "and", "the", "home-centred", "interests", "which", "rise", "up", "around", "the", "man", "who", "first", "finds", "himself", "master", "of", "his", "own", "establishment,", "were", "sufficient", "to", "absorb", "all", "my", "attention,", "while", "Holmes,", "who", "loathed", "every", "form", "of", "society", "with", "his", "whole", "Bohemian", "soul,", "remained", "in", "our", "lodgings", "in", "Baker", "Street,", "buried", "among", "his", "old", "books,", "and", "alternating", "from", "week", "to", "week", "between", "cocaine", "and", "ambition,", "the", "drowsiness", "of", "the", "drug,", "and", "the", "fierce", "energy", "of", "his", "own", "keen", "nature."], text: "My own complete happiness, and the home-centred interests which rise up around the man who first finds himself master of his own establishment, were sufficient to absorb all my attention, while Holmes, who loathed every form of society with his whole Bohemian soul, remained in our lodgings in Baker Street, buried among his old books, and alternating from week to week between cocaine and ambition, the drowsiness of the drug, and the fierce energy of his own keen nature." },
+  { words: ["He", "was", "still,", "as", "ever,", "deeply", "attracted", "by", "the", "study", "of", "crime,", "and", "occupied", "his", "immense", "faculties", "and", "extraordinary", "powers", "of", "observation", "in", "following", "out", "those", "clues,", "and", "clearing", "up", "those", "mysteries", "which", "had", "been", "abandoned", "as", "hopeless", "by", "the", "official", "police."], text: "He was still, as ever, deeply attracted by the study of crime, and occupied his immense faculties and extraordinary powers of observation in following out those clues, and clearing up those mysteries which had been abandoned as hopeless by the official police." },
+  { words: ["From", "time", "to", "time", "I", "heard", "some", "vague", "account", "of", "his", "doings:", "of", "his", "summons", "to", "Odessa", "in", "the", "case", "of", "the", "Trepoff", "murder,", "of", "his", "clearing", "up", "of", "the", "singular", "tragedy", "of", "the", "Atkinson", "brothers", "at", "Trincomalee,", "and", "finally", "of", "the", "mission", "which", "he", "had", "accomplished", "so", "delicately", "and", "successfully", "for", "the", "reigning", "family", "of", "Holland."], text: "From time to time I heard some vague account of his doings: of his summons to Odessa in the case of the Trepoff murder, of his clearing up of the singular tragedy of the Atkinson brothers at Trincomalee, and finally of the mission which he had accomplished so delicately and successfully for the reigning family of Holland." },
+  { words: ["Beyond", "these", "signs", "of", "his", "activity,", "however,", "which", "I", "merely", "shared", "with", "all", "the", "readers", "of", "the", "daily", "press,", "I", "knew", "little", "of", "my", "former", "friend", "and", "companion."], text: "Beyond these signs of his activity, however, which I merely shared with all the readers of the daily press, I knew little of my former friend and companion." },
+  { words: ["One", "night—it", "was", "on", "the", "twentieth", "of", "March,", "1888—I", "was", "returning", "from", "a", "journey", "to", "a", "patient", "(for", "I", "had", "now", "returned", "to", "civil", "practice),", "when", "my", "way", "led", "me", "through", "Baker", "Street."], text: "One night—it was on the twentieth of March, 1888—I was returning from a journey to a patient (for I had now returned to civil practice), when my way led me through Baker Street." },
+  { words: ["As", "I", "passed", "the", "well-remembered", "door,", "which", "must", "always", "be", "associated", "in", "my", "mind", "with", "my", "wooing,", "and", "with", "the", "dark", "incidents", "of", "the", "Study", "in", "Scarlet,", "I", "was", "seized", "with", "a", "keen", "desire", "to", "see", "Holmes", "again,", "and", "to", "know", "how", "he", "was", "employing", "his", "extraordinary", "powers."], text: "As I passed the well-remembered door, which must always be associated in my mind with my wooing, and with the dark incidents of the Study in Scarlet, I was seized with a keen desire to see Holmes again, and to know how he was employing his extraordinary powers." },
+  { words: ["His", "rooms", "were", "brilliantly", "lit,", "and,", "even", "as", "I", "looked", "up,", "I", "saw", "his", "tall,", "spare", "figure", "pass", "twice", "in", "a", "dark", "silhouette", "against", "the", "blind."], text: "His rooms were brilliantly lit, and, even as I looked up, I saw his tall, spare figure pass twice in a dark silhouette against the blind." },
+  { words: ["He", "was", "pacing", "the", "room", "swiftly,", "eagerly,", "with", "his", "head", "sunk", "upon", "his", "chest", "and", "his", "hands", "clasped", "behind", "him."], text: "He was pacing the room swiftly, eagerly, with his head sunk upon his chest and his hands clasped behind him." },
+  { words: ["To", "me,", "who", "knew", "his", "every", "mood", "and", "habit,", "his", "attitude", "and", "manner", "told", "their", "own", "story."], text: "To me, who knew his every mood and habit, his attitude and manner told their own story." },
+  { words: ["He", "was", "at", "work", "again."], text: "He was at work again." },
+  { words: ["He", "had", "risen", "out", "of", "his", "drug-created", "dreams", "and", "was", "hot", "upon", "the", "scent", "of", "some", "new", "problem."], text: "He had risen out of his drug-created dreams and was hot upon the scent of some new problem." },
+  { words: ["I", "rang", "the", "bell", "and", "was", "shown", "up", "to", "the", "chamber", "which", "had", "formerly", "been", "in", "part", "my", "own."], text: "I rang the bell and was shown up to the chamber which had formerly been in part my own." },
+  { words: ["His", "manner", "was", "not", "effusive."], text: "His manner was not effusive." },
+  { words: ["It", "seldom", "was;", "but", "he", "was", "glad,", "I", "think,", "to", "see", "me."], text: "It seldom was; but he was glad, I think, to see me." },
+  { words: ["With", "hardly", "a", "word", "spoken,", "but", "with", "a", "kindly", "eye,", "he", "waved", "me", "to", "an", "armchair,", "threw", "across", "his", "case", "of", "cigars,", "and", "indicated", "a", "spirit", "case", "and", "a", "gasogene", "in", "the", "corner."], text: "With hardly a word spoken, but with a kindly eye, he waved me to an armchair, threw across his case of cigars, and indicated a spirit case and a gasogene in the corner." },
+  { words: ["Then", "he", "stood", "before", "the", "fire", "and", "looked", "me", "over", "in", "his", "singular", "introspective", "fashion."], text: "Then he stood before the fire and looked me over in his singular introspective fashion." },
+  { words: ["“Wedlock", "suits", "you,”", "he", "remarked."], text: "“Wedlock suits you,” he remarked." },
+  { words: ["“I", "think,", "Watson,", "that", "you", "have", "put", "on", "seven", "and", "a", "half", "pounds", "since", "I", "saw", "you.”"], text: "“I think, Watson, that you have put on seven and a half pounds since I saw you.”" },
+  { words: ["“Seven!”", "I", "answered."], text: "“Seven!” I answered." },
+  { words: ["“Indeed,", "I", "should", "have", "thought", "a", "little", "more."], text: "“Indeed, I should have thought a little more." },
+  { words: ["Just", "a", "trifle", "more,", "I", "fancy,", "Watson."], text: "Just a trifle more, I fancy, Watson." },
+  { words: ["And", "in", "practice", "again,", "I", "observe."], text: "And in practice again, I observe." },
+  { words: ["You", "did", "not", "tell", "me", "that", "you", "intended", "to", "go", "into", "harness.”"], text: "You did not tell me that you intended to go into harness.”" },
+  { words: ["“Then,", "how", "do", "you", "know?”"], text: "“Then, how do you know?”" },
+  { words: ["“I", "see", "it,", "I", "deduce", "it."], text: "“I see it, I deduce it." },
+  { words: ["How", "do", "I", "know", "that", "you", "have", "been", "getting", "yourself", "very", "wet", "lately,", "and", "that", "you", "have", "a", "most", "clumsy", "and", "careless", "servant", "girl?”"], text: "How do I know that you have been getting yourself very wet lately, and that you have a most clumsy and careless servant girl?”" },
+  { words: ["“My", "dear", "Holmes,”", "said", "I,", "“this", "is", "too", "much."], text: "“My dear Holmes,” said I, “this is too much." },
+  { words: ["You", "would", "certainly", "have", "been", "burned,", "had", "you", "lived", "a", "few", "centuries", "ago."], text: "You would certainly have been burned, had you lived a few centuries ago." },
+  { words: ["It", "is", "true", "that", "I", "had", "a", "country", "walk", "on", "Thursday", "and", "came", "home", "in", "a", "dreadful", "mess,", "but", "as", "I", "have", "changed", "my", "clothes", "I", "can’t", "imagine", "how", "you", "deduce", "it."], text: "It is true that I had a country walk on Thursday and came home in a dreadful mess, but as I have changed my clothes I can’t imagine how you deduce it." },
+  { words: ["As", "to", "Mary", "Jane,", "she", "is", "incorrigible,", "and", "my", "wife", "has", "given", "her", "notice,", "but", "there,", "again,", "I", "fail", "to", "see", "how", "you", "work", "it", "out.”"], text: "As to Mary Jane, she is incorrigible, and my wife has given her notice, but there, again, I fail to see how you work it out.”" },
+  { words: ["He", "chuckled", "to", "himself", "and", "rubbed", "his", "long,", "nervous", "hands", "together."], text: "He chuckled to himself and rubbed his long, nervous hands together." },
+  { words: ["“It", "is", "simplicity", "itself,”", "said", "he;", "“my", "eyes", "tell", "me", "that", "on", "the", "inside", "of", "your", "left", "shoe,", "just", "where", "the", "firelight", "strikes", "it,", "the", "leather", "is", "scored", "by", "six", "almost", "parallel", "cuts."], text: "“It is simplicity itself,” said he; “my eyes tell me that on the inside of your left shoe, just where the firelight strikes it, the leather is scored by six almost parallel cuts." },
+  { words: ["Obviously", "they", "have", "been", "caused", "by", "someone", "who", "has", "very", "carelessly", "scraped", "round", "the", "edges", "of", "the", "sole", "in", "order", "to", "remove", "crusted", "mud", "from", "it."], text: "Obviously they have been caused by someone who has very carelessly scraped round the edges of the sole in order to remove crusted mud from it." },
+  { words: ["Hence,", "you", "see,", "my", "double", "deduction", "that", "you", "had", "been", "out", "in", "vile", "weather,", "and", "that", "you", "had", "a", "particularly", "malignant", "boot-slitting", "specimen", "of", "the", "London", "slavey."], text: "Hence, you see, my double deduction that you had been out in vile weather, and that you had a particularly malignant boot-slitting specimen of the London slavey." },
+  { words: ["As", "to", "your", "practice,", "if", "a", "gentleman", "walks", "into", "my", "rooms", "smelling", "of", "iodoform,", "with", "a", "black", "mark", "of", "nitrate", "of", "silver", "upon", "his", "right", "forefinger,", "and", "a", "bulge", "on", "the", "right", "side", "of", "his", "top-hat", "to", "show", "where", "he", "has", "secreted", "his", "stethoscope,", "I", "must", "be", "dull,", "indeed,", "if", "I", "do", "not", "pronounce", "him", "to", "be", "an", "active", "member", "of", "the", "medical", "profession.”"], text: "As to your practice, if a gentleman walks into my rooms smelling of iodoform, with a black mark of nitrate of silver upon his right forefinger, and a bulge on the right side of his top-hat to show where he has secreted his stethoscope, I must be dull, indeed, if I do not pronounce him to be an active member of the medical profession.”" },
+  { words: ["I", "could", "not", "help", "laughing", "at", "the", "ease", "with", "which", "he", "explained", "his", "process", "of", "deduction."], text: "I could not help laughing at the ease with which he explained his process of deduction." },
+  { words: ["“When", "I", "hear", "you", "give", "your", "reasons,”", "I", "remarked,", "“the", "thing", "always", "appears", "to", "me", "to", "be", "so", "ridiculously", "simple", "that", "I", "could", "easily", "do", "it", "myself,", "though", "at", "each", "successive", "instance", "of", "your", "reasoning", "I", "am", "baffled", "until", "you", "explain", "your", "process."], text: "“When I hear you give your reasons,” I remarked, “the thing always appears to me to be so ridiculously simple that I could easily do it myself, though at each successive instance of your reasoning I am baffled until you explain your process." },
+  { words: ["And", "yet", "I", "believe", "that", "my", "eyes", "are", "as", "good", "as", "yours.”"], text: "And yet I believe that my eyes are as good as yours.”" },
+  { words: ["“Quite", "so,”", "he", "answered,", "lighting", "a", "cigarette,", "and", "throwing", "himself", "down", "into", "an", "armchair."], text: "“Quite so,” he answered, lighting a cigarette, and throwing himself down into an armchair." },
+  { words: ["“You", "see,", "but", "you", "do", "not", "observe."], text: "“You see, but you do not observe." },
+  { words: ["The", "distinction", "is", "clear."], text: "The distinction is clear." },
+  { words: ["For", "example,", "you", "have", "frequently", "seen", "the", "steps", "which", "lead", "up", "from", "the", "hall", "to", "this", "room.”"], text: "For example, you have frequently seen the steps which lead up from the hall to this room.”" },
+  { words: ["“Frequently.”", "“How", "often?”"], text: "“Frequently.” “How often?”" },
+  { words: ["“Well,", "some", "hundreds", "of", "times.”"], text: "“Well, some hundreds of times.”" },
+  { words: ["“Then", "how", "many", "are", "there?”"], text: "“Then how many are there?”" },
+  { words: ["“How", "many?", "I", "don’t", "know.”"], text: "“How many? I don’t know.”" },
+  { words: ["“Quite", "so!", "You", "have", "not", "observed."], text: "“Quite so! You have not observed." },
+  { words: ["And", "yet", "you", "have", "seen."], text: "And yet you have seen." },
+  { words: ["That", "is", "just", "my", "point."], text: "That is just my point." },
+  { words: ["Now,", "I", "know", "that", "there", "are", "seventeen", "steps,", "because", "I", "have", "both", "seen", "and", "observed."], text: "Now, I know that there are seventeen steps, because I have both seen and observed." },
+  { words: ["By", "the", "way,", "since", "you", "are", "interested", "in", "these", "little", "problems,", "and", "since", "you", "are", "good", "enough", "to", "chronicle", "one", "or", "two", "of", "my", "trifling", "experiences,", "you", "may", "be", "interested", "in", "this.”"], text: "By the way, since you are interested in these little problems, and since you are good enough to chronicle one or two of my trifling experiences, you may be interested in this.”" },
+  { words: ["He", "threw", "over", "a", "sheet", "of", "thick,", "pink-tinted", "notepaper", "which", "had", "been", "lying", "open", "upon", "the", "table."], text: "He threw over a sheet of thick, pink-tinted notepaper which had been lying open upon the table." },
+  { words: ["“It", "came", "by", "the", "last", "post,”", "said", "he."], text: "“It came by the last post,” said he." },
+  { words: ["“Read", "it", "aloud.”"], text: "“Read it aloud.”" },
+  { words: ["The", "note", "was", "undated,", "and", "without", "either", "signature", "or", "address."], text: "The note was undated, and without either signature or address." },
+  { words: ["“There", "will", "call", "upon", "you", "to-night,", "at", "a", "quarter", "to", "eight", "o’clock,”", "it", "said,", "“a", "gentleman", "who", "desires", "to", "consult", "you", "upon", "a", "matter", "of", "the", "very", "deepest", "moment."], text: "“There will call upon you to-night, at a quarter to eight o’clock,” it said, “a gentleman who desires to consult you upon a matter of the very deepest moment." },
+  { words: ["Your", "recent", "services", "to", "one", "of", "the", "royal", "houses", "of", "Europe", "have", "shown", "that", "you", "are", "one", "who", "may", "safely", "be", "trusted", "with", "matters", "which", "are", "of", "an", "importance", "which", "can", "hardly", "be", "exaggerated."], text: "Your recent services to one of the royal houses of Europe have shown that you are one who may safely be trusted with matters which are of an importance which can hardly be exaggerated." },
+  { words: ["This", "account", "of", "you", "we", "have", "from", "all", "quarters", "received."], text: "This account of you we have from all quarters received." },
+  { words: ["Be", "in", "your", "chamber", "then", "at", "that", "hour,", "and", "do", "not", "take", "it", "amiss", "if", "your", "visitor", "wear", "a", "mask.”"], text: "Be in your chamber then at that hour, and do not take it amiss if your visitor wear a mask.”" },
+  { words: ["“This", "is", "indeed", "a", "mystery,”", "I", "remarked."], text: "“This is indeed a mystery,” I remarked." },
+  { words: ["“What", "do", "you", "imagine", "that", "it", "means?”"], text: "“What do you imagine that it means?”" },
+  { words: ["“I", "have", "no", "data", "yet."], text: "“I have no data yet." },
+  { words: ["It", "is", "a", "capital", "mistake", "to", "theorise", "before", "one", "has", "data."], text: "It is a capital mistake to theorise before one has data." },
+  { words: ["Insensibly", "one", "begins", "to", "twist", "facts", "to", "suit", "theories,", "instead", "of", "theories", "to", "suit", "facts."], text: "Insensibly one begins to twist facts to suit theories, instead of theories to suit facts." },
+  { words: ["But", "the", "note", "itself."], text: "But the note itself." },
+  { words: ["What", "do", "you", "deduce", "from", "it?”"], text: "What do you deduce from it?”" },
+  { words: ["I", "carefully", "examined", "the", "writing,", "and", "the", "paper", "upon", "which", "it", "was", "written."], text: "I carefully examined the writing, and the paper upon which it was written." },
+  { words: ["“The", "man", "who", "wrote", "it", "was", "presumably", "well", "to", "do,”", "I", "remarked,", "endeavouring", "to", "imitate", "my", "companion’s", "processes."], text: "“The man who wrote it was presumably well to do,” I remarked, endeavouring to imitate my companion’s processes." },
+  { words: ["“Such", "paper", "could", "not", "be", "bought", "under", "half", "a", "crown", "a", "packet."], text: "“Such paper could not be bought under half a crown a packet." },
+  { words: ["It", "is", "peculiarly", "strong", "and", "stiff.”"], text: "It is peculiarly strong and stiff.”" },
+  { words: ["“Peculiar—that", "is", "the", "very", "word,”", "said", "Holmes."], text: "“Peculiar—that is the very word,” said Holmes." },
+  { words: ["“It", "is", "not", "an", "English", "paper", "at", "all."], text: "“It is not an English paper at all." },
+  { words: ["Hold", "it", "up", "to", "the", "light.”"], text: "Hold it up to the light.”" },
+  { words: ["I", "did", "so,", "and", "saw", "a", "large", "“E”", "with", "a", "small", "“g,”", "a", "“P,”", "and", "a", "large", "“G”", "with", "a", "small", "“t”", "woven", "into", "the", "texture", "of", "the", "paper."], text: "I did so, and saw a large “E” with a small “g,” a “P,” and a large “G” with a small “t” woven into the texture of the paper." },
+  { words: ["“What", "do", "you", "make", "of", "that?”", "asked", "Holmes."], text: "“What do you make of that?” asked Holmes." },
+  { words: ["“The", "name", "of", "the", "maker,", "no", "doubt;", "or", "his", "monogram,", "rather.”"], text: "“The name of the maker, no doubt; or his monogram, rather.”" },
+  { words: ["“Not", "at", "all."], text: "“Not at all." },
+  { words: ["The", "‘G’", "with", "the", "small", "‘t’", "stands", "for", "‘Gesellschaft,’", "which", "is", "the", "German", "for", "‘Company.’"], text: "The ‘G’ with the small ‘t’ stands for ‘Gesellschaft,’ which is the German for ‘Company.’" },
+  { words: ["It", "is", "a", "customary", "contraction", "like", "our", "‘Co.’"], text: "It is a customary contraction like our ‘Co.’" },
+  { words: ["‘P,’", "of", "course,", "stands", "for", "‘Papier.’"], text: "‘P,’ of course, stands for ‘Papier.’" },
+  { words: ["Now", "for", "the", "‘Eg.’"], text: "Now for the ‘Eg.’" },
+  { words: ["Let", "us", "glance", "at", "our", "Continental", "Gazetteer.”"], text: "Let us glance at our Continental Gazetteer.”" },
+  { words: ["He", "took", "down", "a", "heavy", "brown", "volume", "from", "his", "shelves."], text: "He took down a heavy brown volume from his shelves." },
+  { words: ["“Eglow,", "Eglonitz—here", "we", "are,", "Egria."], text: "“Eglow, Eglonitz—here we are, Egria." },
+  { words: ["It", "is", "in", "a", "German-speaking", "country—in", "Bohemia,", "not", "far", "from", "Carlsbad."], text: "It is in a German-speaking country—in Bohemia, not far from Carlsbad." },
+  { words: ["‘Remarkable", "as", "being", "the", "scene", "of", "the", "death", "of", "Wallenstein,", "and", "for", "its", "numerous", "glass-factories", "and", "paper-mills.’"], text: "‘Remarkable as being the scene of the death of Wallenstein, and for its numerous glass-factories and paper-mills.’" },
+  { words: ["Ha,", "ha,", "my", "boy,", "what", "do", "you", "make", "of", "that?”"], text: "Ha, ha, my boy, what do you make of that?”" },
+  { words: ["His", "eyes", "sparkled,", "and", "he", "sent", "up", "a", "great", "blue", "triumphant", "cloud", "from", "his", "cigarette."], text: "His eyes sparkled, and he sent up a great blue triumphant cloud from his cigarette." },
+  { words: ["“The", "paper", "was", "made", "in", "Bohemia,”", "I", "said."], text: "“The paper was made in Bohemia,” I said." },
+  { words: ["“Precisely.", "And", "the", "man", "who", "wrote", "the", "note", "is", "a", "German."], text: "“Precisely. And the man who wrote the note is a German." },
+  { words: ["Do", "you", "note", "the", "peculiar", "construction", "of", "the", "sentence—‘This", "account", "of", "you", "we", "have", "from", "all", "quarters", "received.’"], text: "Do you note the peculiar construction of the sentence—‘This account of you we have from all quarters received.’" },
+  { words: ["A", "Frenchman", "or", "Russian", "could", "not", "have", "written", "that."], text: "A Frenchman or Russian could not have written that." },
+  { words: ["It", "is", "the", "German", "who", "is", "so", "uncourteous", "to", "his", "verbs."], text: "It is the German who is so uncourteous to his verbs." },
+  { words: ["It", "only", "remains,", "therefore,", "to", "discover", "what", "is", "wanted", "by", "this", "German", "who", "writes", "upon", "Bohemian", "paper", "and", "prefers", "wearing", "a", "mask", "to", "showing", "his", "face."], text: "It only remains, therefore, to discover what is wanted by this German who writes upon Bohemian paper and prefers wearing a mask to showing his face." },
+  { words: ["And", "here", "he", "comes,", "if", "I", "am", "not", "mistaken,", "to", "resolve", "all", "our", "doubts.”"], text: "And here he comes, if I am not mistaken, to resolve all our doubts.”" },
+  { words: ["As", "he", "spoke", "there", "was", "the", "sharp", "sound", "of", "horses’", "hoofs", "and", "grating", "wheels", "against", "the", "curb,", "followed", "by", "a", "sharp", "pull", "at", "the", "bell."], text: "As he spoke there was the sharp sound of horses’ hoofs and grating wheels against the curb, followed by a sharp pull at the bell." },
+  { words: ["Holmes", "whistled.", "“A", "pair,", "by", "the", "sound,”", "said", "he."], text: "Holmes whistled. “A pair, by the sound,” said he." },
+  { words: ["“Yes,”", "he", "continued,", "glancing", "out", "of", "the", "window."], text: "“Yes,” he continued, glancing out of the window." },
+  { words: ["“A", "nice", "little", "brougham", "and", "a", "pair", "of", "beauties."], text: "“A nice little brougham and a pair of beauties." },
+  { words: ["A", "hundred", "and", "fifty", "guineas", "apiece."], text: "A hundred and fifty guineas apiece." },
+  { words: ["There’s", "money", "in", "this", "case,", "Watson,", "if", "there", "is", "nothing", "else.”"], text: "There’s money in this case, Watson, if there is nothing else.”" },
+  { words: ["“I", "think", "that", "I", "had", "better", "go,", "Holmes.”"], text: "“I think that I had better go, Holmes.”" },
+  { words: ["“Not", "a", "bit,", "Doctor."], text: "“Not a bit, Doctor." },
+  { words: ["Stay", "where", "you", "are."], text: "Stay where you are." },
+  { words: ["I", "am", "lost", "without", "my", "Boswell."], text: "I am lost without my Boswell." },
+  { words: ["And", "this", "promises", "to", "be", "interesting."], text: "And this promises to be interesting." },
+  { words: ["It", "would", "be", "a", "pity", "to", "miss", "it.”"], text: "It would be a pity to miss it.”" },
+  { words: ["“But", "your", "client—”", "“Never", "mind", "him."], text: "“But your client—” “Never mind him." },
+  { words: ["I", "may", "want", "your", "help,", "and", "so", "may", "he."], text: "I may want your help, and so may he." },
+  { words: ["Here", "he", "comes."], text: "Here he comes." },
+  { words: ["Sit", "down", "in", "that", "armchair,", "Doctor,", "and", "give", "us", "your", "best", "attention.”"], text: "Sit down in that armchair, Doctor, and give us your best attention.”" },
+  { words: ["A", "slow", "and", "heavy", "step,", "which", "had", "been", "heard", "upon", "the", "stairs", "and", "in", "the", "passage,", "paused", "immediately", "outside", "the", "door."], text: "A slow and heavy step, which had been heard upon the stairs and in the passage, paused immediately outside the door." },
+  { words: ["Then", "there", "was", "a", "loud", "and", "authoritative", "tap."], text: "Then there was a loud and authoritative tap." },
+  { words: ["“Come", "in!”", "said", "Holmes."], text: "“Come in!” said Holmes." },
+  { words: ["A", "man", "entered", "who", "could", "hardly", "have", "been", "less", "than", "six", "feet", "six", "inches", "in", "height,", "with", "the", "chest", "and", "limbs", "of", "a", "Hercules."], text: "A man entered who could hardly have been less than six feet six inches in height, with the chest and limbs of a Hercules." },
+  { words: ["His", "dress", "was", "rich", "with", "a", "richness", "which", "would,", "in", "England,", "be", "looked", "upon", "as", "akin", "to", "bad", "taste."], text: "His dress was rich with a richness which would, in England, be looked upon as akin to bad taste." },
+  { words: ["Heavy", "bands", "of", "astrakhan", "were", "slashed", "across", "the", "sleeves", "and", "fronts", "of", "his", "double-breasted", "coat,", "while", "the", "deep", "blue", "cloak", "which", "was", "thrown", "over", "his", "shoulders", "was", "lined", "with", "flame-coloured", "silk", "and", "secured", "at", "the", "neck", "with", "a", "brooch", "which", "consisted", "of", "a", "single", "flaming", "beryl."], text: "Heavy bands of astrakhan were slashed across the sleeves and fronts of his double-breasted coat, while the deep blue cloak which was thrown over his shoulders was lined with flame-coloured silk and secured at the neck with a brooch which consisted of a single flaming beryl." },
+  { words: ["Boots", "which", "extended", "halfway", "up", "his", "calves,", "and", "which", "were", "trimmed", "at", "the", "tops", "with", "rich", "brown", "fur,", "completed", "the", "impression", "of", "barbaric", "opulence", "which", "was", "suggested", "by", "his", "whole", "appearance."], text: "Boots which extended halfway up his calves, and which were trimmed at the tops with rich brown fur, completed the impression of barbaric opulence which was suggested by his whole appearance." },
+  { words: ["He", "carried", "a", "broad-brimmed", "hat", "in", "his", "hand,", "while", "he", "wore", "across", "the", "upper", "part", "of", "his", "face,", "extending", "down", "past", "the", "cheekbones,", "a", "black", "vizard", "mask,", "which", "he", "had", "apparently", "adjusted", "that", "very", "moment,", "for", "his", "hand", "was", "still", "raised", "to", "it", "as", "he", "entered."], text: "He carried a broad-brimmed hat in his hand, while he wore across the upper part of his face, extending down past the cheekbones, a black vizard mask, which he had apparently adjusted that very moment, for his hand was still raised to it as he entered." },
+  { words: ["From", "the", "lower", "part", "of", "the", "face", "he", "appeared", "to", "be", "a", "man", "of", "strong", "character,", "with", "a", "thick,", "hanging", "lip,", "and", "a", "long,", "straight", "chin", "suggestive", "of", "resolution", "pushed", "to", "the", "length", "of", "obstinacy."], text: "From the lower part of the face he appeared to be a man of strong character, with a thick, hanging lip, and a long, straight chin suggestive of resolution pushed to the length of obstinacy." },
+  { words: ["“You", "had", "my", "note?”", "he", "asked", "with", "a", "deep", "harsh", "voice", "and", "a", "strongly", "marked", "German", "accent."], text: "“You had my note?” he asked with a deep harsh voice and a strongly marked German accent." },
+  { words: ["“I", "told", "you", "that", "I", "would", "call.”"], text: "“I told you that I would call.”" },
+  { words: ["He", "looked", "from", "one", "to", "the", "other", "of", "us,", "as", "if", "uncertain", "which", "to", "address."], text: "He looked from one to the other of us, as if uncertain which to address." },
+  { words: ["“Pray", "take", "a", "seat,”", "said", "Holmes."], text: "“Pray take a seat,” said Holmes." },
+  { words: ["“This", "is", "my", "friend", "and", "colleague,", "Dr.", "Watson,", "who", "is", "occasionally", "good", "enough", "to", "help", "me", "in", "my", "cases."], text: "“This is my friend and colleague, Dr. Watson, who is occasionally good enough to help me in my cases." },
+  { words: ["Whom", "have", "I", "the", "honour", "to", "address?”"], text: "Whom have I the honour to address?”" },
+  { words: ["“You", "may", "address", "me", "as", "the", "Count", "Von", "Kramm,", "a", "Bohemian", "nobleman."], text: "“You may address me as the Count Von Kramm, a Bohemian nobleman." },
+  { words: ["I", "understand", "that", "this", "gentleman,", "your", "friend,", "is", "a", "man", "of", "honour", "and", "discretion,", "whom", "I", "may", "trust", "with", "a", "matter", "of", "the", "most", "extreme", "importance."], text: "I understand that this gentleman, your friend, is a man of honour and discretion, whom I may trust with a matter of the most extreme importance." },
+  { words: ["If", "not,", "I", "should", "much", "prefer", "to", "communicate", "with", "you", "alone.”"], text: "If not, I should much prefer to communicate with you alone.”" },
+  { words: ["I", "rose", "to", "go,", "but", "Holmes", "caught", "me", "by", "the", "wrist", "and", "pushed", "me", "back", "into", "my", "chair."], text: "I rose to go, but Holmes caught me by the wrist and pushed me back into my chair." },
+  { words: ["“It", "is", "both,", "or", "none,”", "said", "he."], text: "“It is both, or none,” said he." },
+  { words: ["“You", "may", "say", "before", "this", "gentleman", "anything", "which", "you", "may", "say", "to", "me.”"], text: "“You may say before this gentleman anything which you may say to me.”" },
+  { words: ["The", "Count", "shrugged", "his", "broad", "shoulders."], text: "The Count shrugged his broad shoulders." },
+  { words: ["“Then", "I", "must", "begin,”", "said", "he,", "“by", "binding", "you", "both", "to", "absolute", "secrecy", "for", "two", "years;", "at", "the", "end", "of", "that", "time", "the", "matter", "will", "be", "of", "no", "importance."], text: "“Then I must begin,” said he, “by binding you both to absolute secrecy for two years; at the end of that time the matter will be of no importance." },
+  { words: ["At", "present", "it", "is", "not", "too", "much", "to", "say", "that", "it", "is", "of", "such", "weight", "it", "may", "have", "an", "influence", "upon", "European", "history.”"], text: "At present it is not too much to say that it is of such weight it may have an influence upon European history.”" },
+  { words: ["“I", "promise,”", "said", "Holmes."], text: "“I promise,” said Holmes." },
+  { words: ["“And", "I.”", "“You", "will", "excuse", "this", "mask,”", "continued", "our", "strange", "visitor."], text: "“And I.” “You will excuse this mask,” continued our strange visitor." },
+  { words: ["“The", "august", "person", "who", "employs", "me", "wishes", "his", "agent", "to", "be", "unknown", "to", "you,", "and", "I", "may", "confess", "at", "once", "that", "the", "title", "by", "which", "I", "have", "just", "called", "myself", "is", "not", "exactly", "my", "own.”"], text: "“The august person who employs me wishes his agent to be unknown to you, and I may confess at once that the title by which I have just called myself is not exactly my own.”" },
+  { words: ["“I", "was", "aware", "of", "it,”", "said", "Holmes", "dryly."], text: "“I was aware of it,” said Holmes dryly." },
+  { words: ["“The", "circumstances", "are", "of", "great", "delicacy,", "and", "every", "precaution", "has", "to", "be", "taken", "to", "quench", "what", "might", "grow", "to", "be", "an", "immense", "scandal", "and", "seriously", "compromise", "one", "of", "the", "reigning", "families", "of", "Europe."], text: "“The circumstances are of great delicacy, and every precaution has to be taken to quench what might grow to be an immense scandal and seriously compromise one of the reigning families of Europe." },
+  { words: ["To", "speak", "plainly,", "the", "matter", "implicates", "the", "great", "House", "of", "Ormstein,", "hereditary", "kings", "of", "Bohemia.”"], text: "To speak plainly, the matter implicates the great House of Ormstein, hereditary kings of Bohemia.”" },
+  { words: ["“I", "was", "also", "aware", "of", "that,”", "murmured", "Holmes,", "settling", "himself", "down", "in", "his", "armchair", "and", "closing", "his", "eyes."], text: "“I was also aware of that,” murmured Holmes, settling himself down in his armchair and closing his eyes." },
+  { words: ["Our", "visitor", "glanced", "with", "some", "apparent", "surprise", "at", "the", "languid,", "lounging", "figure", "of", "the", "man", "who", "had", "been", "no", "doubt", "depicted", "to", "him", "as", "the", "most", "incisive", "reasoner", "and", "most", "energetic", "agent", "in", "Europe."], text: "Our visitor glanced with some apparent surprise at the languid, lounging figure of the man who had been no doubt depicted to him as the most incisive reasoner and most energetic agent in Europe." },
+  { words: ["Holmes", "slowly", "reopened", "his", "eyes", "and", "looked", "impatiently", "at", "his", "gigantic", "client."], text: "Holmes slowly reopened his eyes and looked impatiently at his gigantic client." },
+  { words: ["“If", "your", "Majesty", "would", "condescend", "to", "state", "your", "case,”", "he", "remarked,", "“I", "should", "be", "better", "able", "to", "advise", "you.”"], text: "“If your Majesty would condescend to state your case,” he remarked, “I should be better able to advise you.”" },
+  { words: ["The", "man", "sprang", "from", "his", "chair", "and", "paced", "up", "and", "down", "the", "room", "in", "uncontrollable", "agitation."], text: "The man sprang from his chair and paced up and down the room in uncontrollable agitation." },
+  { words: ["Then,", "with", "a", "gesture", "of", "desperation,", "he", "tore", "the", "mask", "from", "his", "face", "and", "hurled", "it", "upon", "the", "ground."], text: "Then, with a gesture of desperation, he tore the mask from his face and hurled it upon the ground." },
+  { words: ["“You", "are", "right,”", "he", "cried;", "“I", "am", "the", "King."], text: "“You are right,” he cried; “I am the King." },
+  { words: ["Why", "should", "I", "attempt", "to", "conceal", "it?”"], text: "Why should I attempt to conceal it?”" },
+  { words: ["“Why,", "indeed?”", "murmured", "Holmes."], text: "“Why, indeed?” murmured Holmes." },
+  { words: ["“Your", "Majesty", "had", "not", "spoken", "before", "I", "was", "aware", "that", "I", "was", "addressing", "Wilhelm", "Gottsreich", "Sigismond", "von", "Ormstein,", "Grand", "Duke", "of", "Cassel-Felstein,", "and", "hereditary", "King", "of", "Bohemia.”"], text: "“Your Majesty had not spoken before I was aware that I was addressing Wilhelm Gottsreich Sigismond von Ormstein, Grand Duke of Cassel-Felstein, and hereditary King of Bohemia.”" },
+  { words: ["“But", "you", "can", "understand,”", "said", "our", "strange", "visitor,", "sitting", "down", "once", "more", "and", "passing", "his", "hand", "over", "his", "high", "white", "forehead,", "“you", "can", "understand", "that", "I", "am", "not", "accustomed", "to", "doing", "such", "business", "in", "my", "own", "person."], text: "“But you can understand,” said our strange visitor, sitting down once more and passing his hand over his high white forehead, “you can understand that I am not accustomed to doing such business in my own person." },
+  { words: ["Yet", "the", "matter", "was", "so", "delicate", "that", "I", "could", "not", "confide", "it", "to", "an", "agent", "without", "putting", "myself", "in", "his", "power."], text: "Yet the matter was so delicate that I could not confide it to an agent without putting myself in his power." },
+  { words: ["I", "have", "come", "incognito", "from", "Prague", "for", "the", "purpose", "of", "consulting", "you.”"], text: "I have come incognito from Prague for the purpose of consulting you.”" },
+  { words: ["“Then,", "pray", "consult,”", "said", "Holmes,", "shutting", "his", "eyes", "once", "more."], text: "“Then, pray consult,” said Holmes, shutting his eyes once more." },
+  { words: ["“The", "facts", "are", "briefly", "these:", "Some", "five", "years", "ago,", "during", "a", "lengthy", "visit", "to", "Warsaw,", "I", "made", "the", "acquaintance", "of", "the", "well-known", "adventuress,", "Irene", "Adler."], text: "“The facts are briefly these: Some five years ago, during a lengthy visit to Warsaw, I made the acquaintance of the well-known adventuress, Irene Adler." },
+  { words: ["The", "name", "is", "no", "doubt", "familiar", "to", "you.”"], text: "The name is no doubt familiar to you.”" },
+  { words: ["“Kindly", "look", "her", "up", "in", "my", "index,", "Doctor,”", "murmured", "Holmes", "without", "opening", "his", "eyes."], text: "“Kindly look her up in my index, Doctor,” murmured Holmes without opening his eyes." },
+  { words: ["For", "many", "years", "he", "had", "adopted", "a", "system", "of", "docketing", "all", "paragraphs", "concerning", "men", "and", "things,", "so", "that", "it", "was", "difficult", "to", "name", "a", "subject", "or", "a", "person", "on", "which", "he", "could", "not", "at", "once", "furnish", "information."], text: "For many years he had adopted a system of docketing all paragraphs concerning men and things, so that it was difficult to name a subject or a person on which he could not at once furnish information." },
+  { words: ["In", "this", "case", "I", "found", "her", "biography", "sandwiched", "in", "between", "that", "of", "a", "Hebrew", "rabbi", "and", "that", "of", "a", "staff-commander", "who", "had", "written", "a", "monograph", "upon", "the", "deep-sea", "fishes."], text: "In this case I found her biography sandwiched in between that of a Hebrew rabbi and that of a staff-commander who had written a monograph upon the deep-sea fishes." },
+  { words: ["“Let", "me", "see!”", "said", "Holmes."], text: "“Let me see!” said Holmes." },
+  { words: ["“Hum!", "Born", "in", "New", "Jersey", "in", "the", "year", "1858.", "Contralto—hum!"], text: "“Hum! Born in New Jersey in the year 1858. Contralto—hum!" },
+  { words: ["La", "Scala,", "hum!"], text: "La Scala, hum!" },
+  { words: ["Prima", "donna", "Imperial", "Opera", "of", "Warsaw—yes!"], text: "Prima donna Imperial Opera of Warsaw—yes!" },
+  { words: ["Retired", "from", "operatic", "stage—ha!"], text: "Retired from operatic stage—ha!" },
+  { words: ["Living", "in", "London—quite", "so!"], text: "Living in London—quite so!" },
+  { words: ["Your", "Majesty,", "as", "I", "understand,", "became", "entangled", "with", "this", "young", "person,", "wrote", "her", "some", "compromising", "letters,", "and", "is", "now", "desirous", "of", "getting", "those", "letters", "back.”"], text: "Your Majesty, as I understand, became entangled with this young person, wrote her some compromising letters, and is now desirous of getting those letters back.”" },
+  { words: ["“Precisely", "so.", "But", "how—”", "“Was", "there", "a", "secret", "marriage?”"], text: "“Precisely so. But how—” “Was there a secret marriage?”" },
+  { words: ["“None.”", "“No", "legal", "papers", "or", "certificates?”"], text: "“None.” “No legal papers or certificates?”" },
+  { words: ["“None.”", "“Then", "I", "fail", "to", "follow", "your", "Majesty."], text: "“None.” “Then I fail to follow your Majesty." },
+  { words: ["If", "this", "young", "person", "should", "produce", "her", "letters", "for", "blackmailing", "or", "other", "purposes,", "how", "is", "she", "to", "prove", "their", "authenticity?”"], text: "If this young person should produce her letters for blackmailing or other purposes, how is she to prove their authenticity?”" },
+  { words: ["“There", "is", "the", "writing.”"], text: "“There is the writing.”" },
+  { words: ["“Pooh,", "pooh!", "Forgery.”"], text: "“Pooh, pooh! Forgery.”" },
+  { words: ["“My", "private", "note-paper.”"], text: "“My private note-paper.”" },
+  { words: ["“Stolen.”", "“My", "own", "seal.”"], text: "“Stolen.” “My own seal.”" },
+  { words: ["“Imitated.”", "“My", "photograph.”"], text: "“Imitated.” “My photograph.”" },
+  { words: ["“Bought.”", "“We", "were", "both", "in", "the", "photograph.”"], text: "“Bought.” “We were both in the photograph.”" },
+  { words: ["“Oh,", "dear!", "That", "is", "very", "bad!"], text: "“Oh, dear! That is very bad!" },
+  { words: ["Your", "Majesty", "has", "indeed", "committed", "an", "indiscretion.”"], text: "Your Majesty has indeed committed an indiscretion.”" },
+  { words: ["“I", "was", "mad—insane.”"], text: "“I was mad—insane.”" },
+  { words: ["“You", "have", "compromised", "yourself", "seriously.”"], text: "“You have compromised yourself seriously.”" },
+  { words: ["“I", "was", "only", "Crown", "Prince", "then."], text: "“I was only Crown Prince then." },
+  { words: ["I", "was", "young."], text: "I was young." },
+  { words: ["I", "am", "but", "thirty", "now.”"], text: "I am but thirty now.”" },
+  { words: ["“It", "must", "be", "recovered.”"], text: "“It must be recovered.”" },
+  { words: ["“We", "have", "tried", "and", "failed.”"], text: "“We have tried and failed.”" },
+  { words: ["“Your", "Majesty", "must", "pay."], text: "“Your Majesty must pay." },
+  { words: ["It", "must", "be", "bought.”"], text: "It must be bought.”" },
+  { words: ["“She", "will", "not", "sell.”"], text: "“She will not sell.”" },
+  { words: ["“Stolen,", "then.”", "“Five", "attempts", "have", "been", "made."], text: "“Stolen, then.” “Five attempts have been made." },
+  { words: ["Twice", "burglars", "in", "my", "pay", "ransacked", "her", "house."], text: "Twice burglars in my pay ransacked her house." },
+  { words: ["Once", "we", "diverted", "her", "luggage", "when", "she", "travelled."], text: "Once we diverted her luggage when she travelled." },
+  { words: ["Twice", "she", "has", "been", "waylaid."], text: "Twice she has been waylaid." },
+  { words: ["There", "has", "been", "no", "result.”"], text: "There has been no result.”" },
+  { words: ["“No", "sign", "of", "it?”"], text: "“No sign of it?”" },
+  { words: ["“Absolutely", "none.”", "Holmes", "laughed."], text: "“Absolutely none.” Holmes laughed." },
+  { words: ["“It", "is", "quite", "a", "pretty", "little", "problem,”", "said", "he."], text: "“It is quite a pretty little problem,” said he." },
+  { words: ["“But", "a", "very", "serious", "one", "to", "me,”", "returned", "the", "King", "reproachfully."], text: "“But a very serious one to me,” returned the King reproachfully." },
+  { words: ["“Very,", "indeed.", "And", "what", "does", "she", "propose", "to", "do", "with", "the", "photograph?”"], text: "“Very, indeed. And what does she propose to do with the photograph?”" },
+  { words: ["“To", "ruin", "me.”"], text: "“To ruin me.”" },
+  { words: ["“But", "how?”", "“I", "am", "about", "to", "be", "married.”"], text: "“But how?” “I am about to be married.”" },
+  { words: ["“So", "I", "have", "heard.”"], text: "“So I have heard.”" },
+  { words: ["“To", "Clotilde", "Lothman", "von", "Saxe-Meningen,", "second", "daughter", "of", "the", "King", "of", "Scandinavia."], text: "“To Clotilde Lothman von Saxe-Meningen, second daughter of the King of Scandinavia." },
+  { words: ["You", "may", "know", "the", "strict", "principles", "of", "her", "family."], text: "You may know the strict principles of her family." },
+  { words: ["She", "is", "herself", "the", "very", "soul", "of", "delicacy."], text: "She is herself the very soul of delicacy." },
+  { words: ["A", "shadow", "of", "a", "doubt", "as", "to", "my", "conduct", "would", "bring", "the", "matter", "to", "an", "end.”"], text: "A shadow of a doubt as to my conduct would bring the matter to an end.”" },
+  { words: ["“And", "Irene", "Adler?”"], text: "“And Irene Adler?”" },
+  { words: ["“Threatens", "to", "send", "them", "the", "photograph."], text: "“Threatens to send them the photograph." },
+  { words: ["And", "she", "will", "do", "it."], text: "And she will do it." },
+  { words: ["I", "know", "that", "she", "will", "do", "it."], text: "I know that she will do it." },
+  { words: ["You", "do", "not", "know", "her,", "but", "she", "has", "a", "soul", "of", "steel."], text: "You do not know her, but she has a soul of steel." },
+  { words: ["She", "has", "the", "face", "of", "the", "most", "beautiful", "of", "women,", "and", "the", "mind", "of", "the", "most", "resolute", "of", "men."], text: "She has the face of the most beautiful of women, and the mind of the most resolute of men." },
+  { words: ["Rather", "than", "I", "should", "marry", "another", "woman,", "there", "are", "no", "lengths", "to", "which", "she", "would", "not", "go—none.”"], text: "Rather than I should marry another woman, there are no lengths to which she would not go—none.”" },
+  { words: ["“You", "are", "sure", "that", "she", "has", "not", "sent", "it", "yet?”"], text: "“You are sure that she has not sent it yet?”" },
+  { words: ["“I", "am", "sure.”"], text: "“I am sure.”" },
+  { words: ["“And", "why?”", "“Because", "she", "has", "said", "that", "she", "would", "send", "it", "on", "the", "day", "when", "the", "betrothal", "was", "publicly", "proclaimed."], text: "“And why?” “Because she has said that she would send it on the day when the betrothal was publicly proclaimed." },
+  { words: ["That", "will", "be", "next", "Monday.”"], text: "That will be next Monday.”" },
+  { words: ["“Oh,", "then", "we", "have", "three", "days", "yet,”", "said", "Holmes", "with", "a", "yawn."], text: "“Oh, then we have three days yet,” said Holmes with a yawn." },
+  { words: ["“That", "is", "very", "fortunate,", "as", "I", "have", "one", "or", "two", "matters", "of", "importance", "to", "look", "into", "just", "at", "present."], text: "“That is very fortunate, as I have one or two matters of importance to look into just at present." },
+  { words: ["Your", "Majesty", "will,", "of", "course,", "stay", "in", "London", "for", "the", "present?”"], text: "Your Majesty will, of course, stay in London for the present?”" },
+  { words: ["“Certainly.", "You", "will", "find", "me", "at", "the", "Langham", "under", "the", "name", "of", "the", "Count", "Von", "Kramm.”"], text: "“Certainly. You will find me at the Langham under the name of the Count Von Kramm.”" },
+  { words: ["“Then", "I", "shall", "drop", "you", "a", "line", "to", "let", "you", "know", "how", "we", "progress.”"], text: "“Then I shall drop you a line to let you know how we progress.”" },
+  { words: ["“Pray", "do", "so."], text: "“Pray do so." },
+  { words: ["I", "shall", "be", "all", "anxiety.”"], text: "I shall be all anxiety.”" },
+  { words: ["“Then,", "as", "to", "money?”"], text: "“Then, as to money?”" },
+  { words: ["“You", "have", "carte", "blanche.”"], text: "“You have carte blanche.”" },
+  { words: ["“Absolutely?”", "“I", "tell", "you", "that", "I", "would", "give", "one", "of", "the", "provinces", "of", "my", "kingdom", "to", "have", "that", "photograph.”"], text: "“Absolutely?” “I tell you that I would give one of the provinces of my kingdom to have that photograph.”" },
+  { words: ["“And", "for", "present", "expenses?”"], text: "“And for present expenses?”" },
+  { words: ["The", "King", "took", "a", "heavy", "chamois", "leather", "bag", "from", "under", "his", "cloak", "and", "laid", "it", "on", "the", "table."], text: "The King took a heavy chamois leather bag from under his cloak and laid it on the table." },
+  { words: ["“There", "are", "three", "hundred", "pounds", "in", "gold", "and", "seven", "hundred", "in", "notes,”", "he", "said."], text: "“There are three hundred pounds in gold and seven hundred in notes,” he said." },
+  { words: ["Holmes", "scribbled", "a", "receipt", "upon", "a", "sheet", "of", "his", "note-book", "and", "handed", "it", "to", "him."], text: "Holmes scribbled a receipt upon a sheet of his note-book and handed it to him." },
+  { words: ["“And", "Mademoiselle’s", "address?”", "he", "asked."], text: "“And Mademoiselle’s address?” he asked." },
+  { words: ["“Is", "Briony", "Lodge,", "Serpentine", "Avenue,", "St.", "John’s", "Wood.”"], text: "“Is Briony Lodge, Serpentine Avenue, St. John’s Wood.”" },
+  { words: ["Holmes", "took", "a", "note", "of", "it."], text: "Holmes took a note of it." },
+  { words: ["“One", "other", "question,”", "said", "he."], text: "“One other question,” said he." },
+  { words: ["“Was", "the", "photograph", "a", "cabinet?”"], text: "“Was the photograph a cabinet?”" },
+  { words: ["“It", "was.”", "“Then,", "good-night,", "your", "Majesty,", "and", "I", "trust", "that", "we", "shall", "soon", "have", "some", "good", "news", "for", "you."], text: "“It was.” “Then, good-night, your Majesty, and I trust that we shall soon have some good news for you." },
+  { words: ["And", "good-night,", "Watson,”", "he", "added,", "as", "the", "wheels", "of", "the", "royal", "brougham", "rolled", "down", "the", "street."], text: "And good-night, Watson,” he added, as the wheels of the royal brougham rolled down the street." },
+  { words: ["“If", "you", "will", "be", "good", "enough", "to", "call", "to-morrow", "afternoon", "at", "three", "o’clock", "I", "should", "like", "to", "chat", "this", "little", "matter", "over", "with", "you.”"], text: "“If you will be good enough to call to-morrow afternoon at three o’clock I should like to chat this little matter over with you.”" },
+  { words: ["At", "three", "o’clock", "precisely", "I", "was", "at", "Baker", "Street,", "but", "Holmes", "had", "not", "yet", "returned."], text: "At three o’clock precisely I was at Baker Street, but Holmes had not yet returned." },
+  { words: ["The", "landlady", "informed", "me", "that", "he", "had", "left", "the", "house", "shortly", "after", "eight", "o’clock", "in", "the", "morning."], text: "The landlady informed me that he had left the house shortly after eight o’clock in the morning." },
+  { words: ["I", "sat", "down", "beside", "the", "fire,", "however,", "with", "the", "intention", "of", "awaiting", "him,", "however", "long", "he", "might", "be."], text: "I sat down beside the fire, however, with the intention of awaiting him, however long he might be." },
+  { words: ["I", "was", "already", "deeply", "interested", "in", "his", "inquiry,", "for,", "though", "it", "was", "surrounded", "by", "none", "of", "the", "grim", "and", "strange", "features", "which", "were", "associated", "with", "the", "two", "crimes", "which", "I", "have", "already", "recorded,", "still,", "the", "nature", "of", "the", "case", "and", "the", "exalted", "station", "of", "his", "client", "gave", "it", "a", "character", "of", "its", "own."], text: "I was already deeply interested in his inquiry, for, though it was surrounded by none of the grim and strange features which were associated with the two crimes which I have already recorded, still, the nature of the case and the exalted station of his client gave it a character of its own." },
+  { words: ["Indeed,", "apart", "from", "the", "nature", "of", "the", "investigation", "which", "my", "friend", "had", "on", "hand,", "there", "was", "something", "in", "his", "masterly", "grasp", "of", "a", "situation,", "and", "his", "keen,", "incisive", "reasoning,", "which", "made", "it", "a", "pleasure", "to", "me", "to", "study", "his", "system", "of", "work,", "and", "to", "follow", "the", "quick,", "subtle", "methods", "by", "which", "he", "disentangled", "the", "most", "inextricable", "mysteries."], text: "Indeed, apart from the nature of the investigation which my friend had on hand, there was something in his masterly grasp of a situation, and his keen, incisive reasoning, which made it a pleasure to me to study his system of work, and to follow the quick, subtle methods by which he disentangled the most inextricable mysteries." },
+  { words: ["So", "accustomed", "was", "I", "to", "his", "invariable", "success", "that", "the", "very", "possibility", "of", "his", "failing", "had", "ceased", "to", "enter", "into", "my", "head."], text: "So accustomed was I to his invariable success that the very possibility of his failing had ceased to enter into my head." },
+  { words: ["It", "was", "close", "upon", "four", "before", "the", "door", "opened,", "and", "a", "drunken-looking", "groom,", "ill-kempt", "and", "side-whiskered,", "with", "an", "inflamed", "face", "and", "disreputable", "clothes,", "walked", "into", "the", "room."], text: "It was close upon four before the door opened, and a drunken-looking groom, ill-kempt and side-whiskered, with an inflamed face and disreputable clothes, walked into the room." },
+  { words: ["Accustomed", "as", "I", "was", "to", "my", "friend’s", "amazing", "powers", "in", "the", "use", "of", "disguises,", "I", "had", "to", "look", "three", "times", "before", "I", "was", "certain", "that", "it", "was", "indeed", "he."], text: "Accustomed as I was to my friend’s amazing powers in the use of disguises, I had to look three times before I was certain that it was indeed he." },
+  { words: ["With", "a", "nod", "he", "vanished", "into", "the", "bedroom,", "whence", "he", "emerged", "in", "five", "minutes", "tweed-suited", "and", "respectable,", "as", "of", "old."], text: "With a nod he vanished into the bedroom, whence he emerged in five minutes tweed-suited and respectable, as of old." },
+  { words: ["Putting", "his", "hands", "into", "his", "pockets,", "he", "stretched", "out", "his", "legs", "in", "front", "of", "the", "fire", "and", "laughed", "heartily", "for", "some", "minutes."], text: "Putting his hands into his pockets, he stretched out his legs in front of the fire and laughed heartily for some minutes." },
+  { words: ["“Well,", "really!”", "he", "cried,", "and", "then", "he", "choked", "and", "laughed", "again", "until", "he", "was", "obliged", "to", "lie", "back,", "limp", "and", "helpless,", "in", "the", "chair."], text: "“Well, really!” he cried, and then he choked and laughed again until he was obliged to lie back, limp and helpless, in the chair." },
+  { words: ["“What", "is", "it?”"], text: "“What is it?”" },
+  { words: ["“It’s", "quite", "too", "funny."], text: "“It’s quite too funny." },
+  { words: ["I", "am", "sure", "you", "could", "never", "guess", "how", "I", "employed", "my", "morning,", "or", "what", "I", "ended", "by", "doing.”"], text: "I am sure you could never guess how I employed my morning, or what I ended by doing.”" },
+  { words: ["“I", "can’t", "imagine."], text: "“I can’t imagine." },
+  { words: ["I", "suppose", "that", "you", "have", "been", "watching", "the", "habits,", "and", "perhaps", "the", "house,", "of", "Miss", "Irene", "Adler.”"], text: "I suppose that you have been watching the habits, and perhaps the house, of Miss Irene Adler.”" },
+  { words: ["“Quite", "so;", "but", "the", "sequel", "was", "rather", "unusual."], text: "“Quite so; but the sequel was rather unusual." },
+  { words: ["I", "will", "tell", "you,", "however."], text: "I will tell you, however." },
+  { words: ["I", "left", "the", "house", "a", "little", "after", "eight", "o’clock", "this", "morning", "in", "the", "character", "of", "a", "groom", "out", "of", "work."], text: "I left the house a little after eight o’clock this morning in the character of a groom out of work." },
+  { words: ["There", "is", "a", "wonderful", "sympathy", "and", "freemasonry", "among", "horsey", "men."], text: "There is a wonderful sympathy and freemasonry among horsey men." },
+  { words: ["Be", "one", "of", "them,", "and", "you", "will", "know", "all", "that", "there", "is", "to", "know."], text: "Be one of them, and you will know all that there is to know." },
+  { words: ["I", "soon", "found", "Briony", "Lodge.", "It", "is", "a", "bijou", "villa,", "with", "a", "garden", "at", "the", "back,", "but", "built", "out", "in", "front", "right", "up", "to"], text: "I soon found Briony Lodge. It is a bijou villa, with a garden at the back, but built out in front right up to" }
 ];
 var steamyWords = [
   "Ours",
@@ -23020,11 +23730,11 @@ var steamyWords = [
   "the",
   "love",
   "experience.",
-  "_L'amour",
+  "L'amour",
   "avait",
   "passé",
   "par",
-  "là_,",
+  "là,",
   "as",
   "somebody",
   "puts",
@@ -23762,7 +24472,7 @@ var steamyWords = [
   "sort,",
   "but",
   "still",
-  "_it_.",
+  "it.",
   "His",
   "father",
   "was",
@@ -24243,8 +24953,8 @@ var steamyWords = [
   "authorities",
   "were",
   "ridiculous",
-  "_ab",
-  "ovo_,",
+  "ab",
+  "ovo,",
   "not",
   "because",
   "of",
@@ -25516,6 +26226,239 @@ var steamyWords = [
   "The",
   "colliers"
 ];
+var steamySentences = [
+  { words: ["Ours", "is", "essentially", "a", "tragic", "age,", "so", "we", "refuse", "to", "take", "it", "tragically."], text: "Ours is essentially a tragic age, so we refuse to take it tragically." },
+  { words: ["The", "cataclysm", "has", "happened,", "we", "are", "among", "the", "ruins,", "we", "start", "to", "build", "up", "new", "little", "habitats,", "to", "have", "new", "little", "hopes."], text: "The cataclysm has happened, we are among the ruins, we start to build up new little habitats, to have new little hopes." },
+  { words: ["It", "is", "rather", "hard", "work:", "there", "is", "now", "no", "smooth", "road", "into", "the", "future:", "but", "we", "go", "round,", "or", "scramble", "over", "the", "obstacles."], text: "It is rather hard work: there is now no smooth road into the future: but we go round, or scramble over the obstacles." },
+  { words: ["We've", "got", "to", "live,", "no", "matter", "how", "many", "skies", "have", "fallen."], text: "We've got to live, no matter how many skies have fallen." },
+  { words: ["This", "was", "more", "or", "less", "Constance", "Chatterley's", "position."], text: "This was more or less Constance Chatterley's position." },
+  { words: ["The", "war", "had", "brought", "the", "roof", "down", "over", "her", "head."], text: "The war had brought the roof down over her head." },
+  { words: ["And", "she", "had", "realised", "that", "one", "must", "live", "and", "learn."], text: "And she had realised that one must live and learn." },
+  { words: ["She", "married", "Clifford", "Chatterley", "in", "1917,", "when", "he", "was", "home", "for", "a", "month", "on", "leave."], text: "She married Clifford Chatterley in 1917, when he was home for a month on leave." },
+  { words: ["They", "had", "a", "month's", "honeymoon."], text: "They had a month's honeymoon." },
+  { words: ["Then", "he", "went", "back", "to", "Flanders:", "to", "be", "shipped", "over", "to", "England", "again", "six", "months", "later,", "more", "or", "less", "in", "bits."], text: "Then he went back to Flanders: to be shipped over to England again six months later, more or less in bits." },
+  { words: ["Constance,", "his", "wife,", "was", "then", "twenty-three", "years", "old,", "and", "he", "was", "twenty-nine."], text: "Constance, his wife, was then twenty-three years old, and he was twenty-nine." },
+  { words: ["His", "hold", "on", "life", "was", "marvellous."], text: "His hold on life was marvellous." },
+  { words: ["He", "didn't", "die,", "and", "the", "bits", "seemed", "to", "grow", "together", "again."], text: "He didn't die, and the bits seemed to grow together again." },
+  { words: ["For", "two", "years", "he", "remained", "in", "the", "doctor's", "hands."], text: "For two years he remained in the doctor's hands." },
+  { words: ["Then", "he", "was", "pronounced", "a", "cure,", "and", "could", "return", "to", "life", "again,", "with", "the", "lower", "half", "of", "his", "body,", "from", "the", "hips", "down,", "paralysed", "for", "ever."], text: "Then he was pronounced a cure, and could return to life again, with the lower half of his body, from the hips down, paralysed for ever." },
+  { words: ["This", "was", "in", "1920.", "They", "returned,", "Clifford", "and", "Constance,", "to", "his", "home,", "Wragby", "Hall,", "the", "family", '"seat."'], text: 'This was in 1920. They returned, Clifford and Constance, to his home, Wragby Hall, the family "seat."' },
+  { words: ["His", "father", "had", "died,", "Clifford", "was", "now", "a", "baronet,", "Sir", "Clifford,", "and", "Constance", "was", "Lady", "Chatterley."], text: "His father had died, Clifford was now a baronet, Sir Clifford, and Constance was Lady Chatterley." },
+  { words: ["They", "came", "to", "start", "housekeeping", "and", "married", "life", "in", "the", "rather", "forlorn", "home", "of", "the", "Chatterleys", "on", "a", "rather", "inadequate", "income."], text: "They came to start housekeeping and married life in the rather forlorn home of the Chatterleys on a rather inadequate income." },
+  { words: ["Clifford", "had", "a", "sister,", "but", "she", "had", "departed."], text: "Clifford had a sister, but she had departed." },
+  { words: ["Otherwise", "there", "were", "no", "near", "relatives."], text: "Otherwise there were no near relatives." },
+  { words: ["The", "elder", "brother", "was", "dead", "in", "the", "war."], text: "The elder brother was dead in the war." },
+  { words: ["Crippled", "for", "ever,", "knowing", "he", "could", "never", "have", "any", "children,", "Clifford", "came", "home", "to", "the", "smoky", "Midlands", "to", "keep", "the", "Chatterley", "name", "alive", "while", "he", "could."], text: "Crippled for ever, knowing he could never have any children, Clifford came home to the smoky Midlands to keep the Chatterley name alive while he could." },
+  { words: ["He", "was", "not", "really", "downcast."], text: "He was not really downcast." },
+  { words: ["He", "could", "wheel", "himself", "about", "in", "a", "wheeled", "chair,", "and", "he", "had", "a", "bath-chair", "with", "a", "small", "motor", "attachment,", "so", "he", "could", "drive", "himself", "slowly", "round", "the", "garden", "and", "into", "the", "fine", "melancholy", "park,", "of", "which", "he", "was", "really", "so", "proud,", "though", "he", "pretended", "to", "be", "flippant", "about", "it."], text: "He could wheel himself about in a wheeled chair, and he had a bath-chair with a small motor attachment, so he could drive himself slowly round the garden and into the fine melancholy park, of which he was really so proud, though he pretended to be flippant about it." },
+  { words: ["Having", "suffered", "so", "much,", "the", "capacity", "for", "suffering", "had", "to", "some", "extent", "left", "him."], text: "Having suffered so much, the capacity for suffering had to some extent left him." },
+  { words: ["He", "remained", "strange", "and", "bright", "and", "cheerful,", "almost,", "one", "might", "say,", "chirpy,", "with", "his", "ruddy,", "healthy-looking", "face,", "and", "his", "pale-blue,", "challenging", "bright", "eyes."], text: "He remained strange and bright and cheerful, almost, one might say, chirpy, with his ruddy, healthy-looking face, and his pale-blue, challenging bright eyes." },
+  { words: ["His", "shoulders", "were", "broad", "and", "strong,", "his", "hands", "were", "very", "strong."], text: "His shoulders were broad and strong, his hands were very strong." },
+  { words: ["He", "was", "expensively", "dressed,", "and", "wore", "handsome", "neckties", "from", "Bond", "Street."], text: "He was expensively dressed, and wore handsome neckties from Bond Street." },
+  { words: ["Yet", "still", "in", "his", "face", "one", "saw", "the", "watchful", "look,", "the", "slight", "vacancy", "of", "a", "cripple."], text: "Yet still in his face one saw the watchful look, the slight vacancy of a cripple." },
+  { words: ["He", "had", "so", "very", "nearly", "lost", "his", "life,", "that", "what", "remained", "was", "wonderfully", "precious", "to", "him."], text: "He had so very nearly lost his life, that what remained was wonderfully precious to him." },
+  { words: ["It", "was", "obvious", "in", "the", "anxious", "brightness", "of", "his", "eyes,", "how", "proud", "he", "was,", "after", "the", "great", "shock,", "of", "being", "alive."], text: "It was obvious in the anxious brightness of his eyes, how proud he was, after the great shock, of being alive." },
+  { words: ["But", "he", "had", "been", "so", "much", "hurt", "that", "something", "inside", "him", "had", "perished,", "some", "of", "his", "feelings", "had", "gone."], text: "But he had been so much hurt that something inside him had perished, some of his feelings had gone." },
+  { words: ["There", "was", "a", "blank", "of", "insentience."], text: "There was a blank of insentience." },
+  { words: ["Constance,", "his", "wife,", "was", "a", "ruddy,", "country-looking", "girl", "with", "soft", "brown", "hair", "and", "sturdy", "body,", "and", "slow", "movements,", "full", "of", "unusual", "energy."], text: "Constance, his wife, was a ruddy, country-looking girl with soft brown hair and sturdy body, and slow movements, full of unusual energy." },
+  { words: ["She", "had", "big,", "wondering", "eyes,", "and", "a", "soft", "mild", "voice,", "and", "seemed", "just", "to", "have", "come", "from", "her", "native", "village."], text: "She had big, wondering eyes, and a soft mild voice, and seemed just to have come from her native village." },
+  { words: ["It", "was", "not", "so", "at", "all."], text: "It was not so at all." },
+  { words: ["Her", "father", "was", "the", "once", "well-known", "R.", "A.,", "old", "Sir", "Malcolm", "Reid."], text: "Her father was the once well-known R. A., old Sir Malcolm Reid." },
+  { words: ["Her", "mother", "had", "been", "one", "of", "the", "cultivated", "Fabians", "in", "the", "palmy,", "rather", "pre-Raphaelite", "days."], text: "Her mother had been one of the cultivated Fabians in the palmy, rather pre-Raphaelite days." },
+  { words: ["Between", "artists", "and", "cultured", "socialists,", "Constance", "and", "her", "sister", "Hilda", "had", "what", "might", "be", "called", "an", "aesthetically", "unconventional", "upbringing."], text: "Between artists and cultured socialists, Constance and her sister Hilda had what might be called an aesthetically unconventional upbringing." },
+  { words: ["They", "had", "been", "taken", "to", "Paris", "and", "Florence", "and", "Rome", "to", "breathe", "in", "art,", "and", "they", "had", "been", "taken", "also", "in", "the", "other", "direction,", "to", "the", "Hague", "and", "Berlin,", "to", "great", "Socialist", "conventions,", "where", "the", "speakers", "spoke", "in", "every", "civilised", "tongue,", "and", "no", "one", "was", "abashed."], text: "They had been taken to Paris and Florence and Rome to breathe in art, and they had been taken also in the other direction, to the Hague and Berlin, to great Socialist conventions, where the speakers spoke in every civilised tongue, and no one was abashed." },
+  { words: ["The", "two", "girls,", "therefore,", "were", "from", "an", "early", "age", "not", "the", "least", "daunted", "by", "either", "art", "or", "ideal", "politics."], text: "The two girls, therefore, were from an early age not the least daunted by either art or ideal politics." },
+  { words: ["It", "was", "their", "natural", "atmosphere."], text: "It was their natural atmosphere." },
+  { words: ["They", "were", "at", "once", "cosmopolitan", "and", "provincial,", "with", "the", "cosmopolitan", "provincialism", "of", "art", "that", "goes", "with", "pure", "social", "ideals."], text: "They were at once cosmopolitan and provincial, with the cosmopolitan provincialism of art that goes with pure social ideals." },
+  { words: ["They", "had", "been", "sent", "to", "Dresden", "at", "the", "age", "of", "fifteen,", "for", "music", "among", "other", "things."], text: "They had been sent to Dresden at the age of fifteen, for music among other things." },
+  { words: ["And", "they", "had", "had", "a", "good", "time", "there."], text: "And they had had a good time there." },
+  { words: ["They", "lived", "freely", "among", "the", "students,", "they", "argued", "with", "the", "men", "over", "philosophical,", "sociological", "and", "artistic", "matters,", "they", "were", "just", "as", "good", "as", "the", "men", "themselves:", "only", "better,", "since", "they", "were", "women."], text: "They lived freely among the students, they argued with the men over philosophical, sociological and artistic matters, they were just as good as the men themselves: only better, since they were women." },
+  { words: ["And", "they", "tramped", "off", "to", "the", "forests", "with", "sturdy", "youths", "bearing", "guitars,", "twang-twang!"], text: "And they tramped off to the forests with sturdy youths bearing guitars, twang-twang!" },
+  { words: ["They", "sang", "the", "Wandervogel", "songs,", "and", "they", "were", "free."], text: "They sang the Wandervogel songs, and they were free." },
+  { words: ["Free!", "That", "was", "the", "great", "word."], text: "Free! That was the great word." },
+  { words: ["Out", "in", "the", "open", "world,", "out", "in", "the", "forests", "of", "the", "morning,", "with", "lusty", "and", "splendid-throated", "young", "fellows,", "free", "to", "do", "as", "they", "liked,", "and--above", "all--to", "say", "what", "they", "liked."], text: "Out in the open world, out in the forests of the morning, with lusty and splendid-throated young fellows, free to do as they liked, and--above all--to say what they liked." },
+  { words: ["It", "was", "the", "talk", "that", "mattered", "supremely:", "the", "impassioned", "interchange", "of", "talk."], text: "It was the talk that mattered supremely: the impassioned interchange of talk." },
+  { words: ["Love", "was", "only", "a", "minor", "accompaniment."], text: "Love was only a minor accompaniment." },
+  { words: ["Both", "Hilda", "and", "Constance", "had", "had", "their", "tentative", "love", "affairs", "by", "the", "time", "they", "were", "eighteen."], text: "Both Hilda and Constance had had their tentative love affairs by the time they were eighteen." },
+  { words: ["The", "young", "men", "with", "whom", "they", "talked", "so", "passionately", "and", "sang", "so", "lustily", "and", "camped", "under", "the", "trees", "in", "such", "freedom", "wanted,", "of", "course,", "the", "love", "connection."], text: "The young men with whom they talked so passionately and sang so lustily and camped under the trees in such freedom wanted, of course, the love connection." },
+  { words: ["The", "girls", "were", "doubtful,", "but", "then", "the", "thing", "was", "so", "much", "talked", "about,", "it", "was", "supposed", "to", "be", "so", "important."], text: "The girls were doubtful, but then the thing was so much talked about, it was supposed to be so important." },
+  { words: ["And", "the", "men", "were", "so", "humble", "and", "craving."], text: "And the men were so humble and craving." },
+  { words: ["Why", "couldn't", "a", "girl", "be", "queenly,", "and", "give", "the", "gift", "of", "herself?"], text: "Why couldn't a girl be queenly, and give the gift of herself?" },
+  { words: ["So", "they", "had", "given", "the", "gift", "of", "themselves,", "each", "to", "the", "youth", "with", "whom", "she", "had", "the", "most", "subtle", "and", "intimate", "arguments."], text: "So they had given the gift of themselves, each to the youth with whom she had the most subtle and intimate arguments." },
+  { words: ["The", "arguments,", "the", "discussions", "were", "the", "great", "thing:", "the", "love-making", "and", "connection", "were", "only", "a", "sort", "of", "primitive", "reversion", "and", "a", "bit", "of", "an", "anticlimax."], text: "The arguments, the discussions were the great thing: the love-making and connection were only a sort of primitive reversion and a bit of an anticlimax." },
+  { words: ["One", "was", "less", "in", "love", "with", "the", "boy", "afterwards,", "and", "a", "little", "inclined", "to", "hate", "him,", "as", "if", "he", "had", "trespassed", "on", "one's", "privacy", "and", "inner", "freedom."], text: "One was less in love with the boy afterwards, and a little inclined to hate him, as if he had trespassed on one's privacy and inner freedom." },
+  { words: ["For,", "of", "course,", "being", "a", "girl,", "one's", "whole", "dignity", "and", "meaning", "in", "life", "consisted", "in", "the", "achievement", "of", "an", "absolute,", "a", "perfect,", "a", "pure", "and", "noble", "freedom."], text: "For, of course, being a girl, one's whole dignity and meaning in life consisted in the achievement of an absolute, a perfect, a pure and noble freedom." },
+  { words: ["What", "else", "did", "a", "girl's", "life", "mean?"], text: "What else did a girl's life mean?" },
+  { words: ["To", "shake", "off", "the", "old", "and", "sordid", "connections", "and", "subjections."], text: "To shake off the old and sordid connections and subjections." },
+  { words: ["And", "however", "one", "might", "sentimentalise", "it,", "this", "sex", "business", "was", "one", "of", "the", "most", "ancient,", "sordid", "connections", "and", "subjections."], text: "And however one might sentimentalise it, this sex business was one of the most ancient, sordid connections and subjections." },
+  { words: ["Poets", "who", "glorified", "it", "were", "mostly", "men."], text: "Poets who glorified it were mostly men." },
+  { words: ["Women", "had", "always", "known", "there", "was", "something", "better,", "something", "higher."], text: "Women had always known there was something better, something higher." },
+  { words: ["And", "now", "they", "knew", "it", "more", "definitely", "than", "ever."], text: "And now they knew it more definitely than ever." },
+  { words: ["The", "beautiful", "pure", "freedom", "of", "a", "woman", "was", "infinitely", "more", "wonderful", "than", "any", "sexual", "love."], text: "The beautiful pure freedom of a woman was infinitely more wonderful than any sexual love." },
+  { words: ["The", "only", "unfortunate", "thing", "was", "that", "men", "lagged", "so", "far", "behind", "women", "in", "the", "matter."], text: "The only unfortunate thing was that men lagged so far behind women in the matter." },
+  { words: ["They", "insisted", "on", "the", "sex", "thing", "like", "dogs."], text: "They insisted on the sex thing like dogs." },
+  { words: ["And", "a", "woman", "had", "to", "yield."], text: "And a woman had to yield." },
+  { words: ["A", "man", "was", "like", "a", "child", "with", "his", "appetites."], text: "A man was like a child with his appetites." },
+  { words: ["A", "woman", "had", "to", "yield", "him", "what", "he", "wanted,", "or", "like", "a", "child", "he", "would", "probably", "turn", "nasty", "and", "flounce", "away", "and", "spoil", "what", "was", "a", "very", "pleasant", "connection."], text: "A woman had to yield him what he wanted, or like a child he would probably turn nasty and flounce away and spoil what was a very pleasant connection." },
+  { words: ["But", "a", "woman", "could", "yield", "to", "a", "man", "without", "yielding", "her", "inner,", "free", "self."], text: "But a woman could yield to a man without yielding her inner, free self." },
+  { words: ["That", "the", "poets", "and", "talkers", "about", "sex", "did", "not", "seem", "to", "have", "taken", "sufficiently", "into", "account."], text: "That the poets and talkers about sex did not seem to have taken sufficiently into account." },
+  { words: ["A", "woman", "could", "take", "a", "man", "without", "really", "giving", "herself", "away."], text: "A woman could take a man without really giving herself away." },
+  { words: ["Certainly", "she", "could", "take", "him", "without", "giving", "herself", "into", "his", "power."], text: "Certainly she could take him without giving herself into his power." },
+  { words: ["Rather", "she", "could", "use", "this", "sex", "thing", "to", "have", "power", "over", "him."], text: "Rather she could use this sex thing to have power over him." },
+  { words: ["For", "she", "only", "had", "to", "hold", "herself", "back", "in", "sexual", "intercourse,", "and", "let", "him", "finish", "and", "expend", "himself", "without", "herself", "coming", "to", "the", "crisis:", "and", "then", "she", "could", "prolong", "the", "connection", "and", "achieve", "her", "orgasm", "and", "her", "crisis", "while", "he", "was", "merely", "her", "tool."], text: "For she only had to hold herself back in sexual intercourse, and let him finish and expend himself without herself coming to the crisis: and then she could prolong the connection and achieve her orgasm and her crisis while he was merely her tool." },
+  { words: ["Both", "sisters", "had", "had", "their", "love", "experience", "by", "the", "time", "the", "war", "came,", "and", "they", "were", "hurried", "home."], text: "Both sisters had had their love experience by the time the war came, and they were hurried home." },
+  { words: ["Neither", "was", "ever", "in", "love", "with", "a", "young", "man", "unless", "he", "and", "she", "were", "verbally", "very", "near:", "that", "is", "unless", "they", "were", "profoundly", "interested,", "TALKING", "to", "one", "another."], text: "Neither was ever in love with a young man unless he and she were verbally very near: that is unless they were profoundly interested, TALKING to one another." },
+  { words: ["The", "amazing,", "the", "profound,", "the", "unbelievable", "thrill", "there", "was", "in", "passionately", "talking", "to", "some", "really", "clever", "young", "man", "by", "the", "hour,", "resuming", "day", "after", "day", "for", "months", "...", "this", "they", "had", "never", "realised", "till", "it", "happened!"], text: "The amazing, the profound, the unbelievable thrill there was in passionately talking to some really clever young man by the hour, resuming day after day for months ... this they had never realised till it happened!" },
+  { words: ["The", "paradisal", "promise:", "Thou", "shalt", "have", "men", "to", "talk", "to!--had", "never", "been", "uttered."], text: "The paradisal promise: Thou shalt have men to talk to!--had never been uttered." },
+  { words: ["It", "was", "fulfilled", "before", "they", "knew", "what", "a", "promise", "it", "was."], text: "It was fulfilled before they knew what a promise it was." },
+  { words: ["And", "if", "after", "the", "roused", "intimacy", "of", "these", "vivid", "and", "soul-enlightened", "discussions", "the", "sex", "thing", "became", "more", "or", "less", "inevitable,", "then", "let", "it."], text: "And if after the roused intimacy of these vivid and soul-enlightened discussions the sex thing became more or less inevitable, then let it." },
+  { words: ["It", "marked", "the", "end", "of", "a", "chapter."], text: "It marked the end of a chapter." },
+  { words: ["It", "had", "a", "thrill", "of", "its", "own", "too:", "a", "queer", "vibrating", "thrill", "inside", "the", "body,", "a", "final", "spasm", "of", "self-assertion,", "like", "the", "last", "word,", "exciting,", "and", "very", "like", "the", "row", "of", "asterisks", "that", "can", "be", "put", "to", "show", "the", "end", "of", "a", "paragraph,", "and", "a", "break", "in", "the", "theme."], text: "It had a thrill of its own too: a queer vibrating thrill inside the body, a final spasm of self-assertion, like the last word, exciting, and very like the row of asterisks that can be put to show the end of a paragraph, and a break in the theme." },
+  { words: ["When", "the", "girls", "came", "home", "for", "the", "summer", "holidays", "of", "1913,", "when", "Hilda", "was", "twenty", "and", "Connie", "eighteen,", "their", "father", "could", "see", "plainly", "that", "they", "had", "had", "the", "love", "experience."], text: "When the girls came home for the summer holidays of 1913, when Hilda was twenty and Connie eighteen, their father could see plainly that they had had the love experience." },
+  { words: ["L'amour", "avait", "passé", "par", "là,", "as", "somebody", "puts", "it."], text: "L'amour avait passé par là, as somebody puts it." },
+  { words: ["But", "he", "was", "a", "man", "of", "experience", "himself,", "and", "let", "life", "take", "its", "course."], text: "But he was a man of experience himself, and let life take its course." },
+  { words: ["As", "for", "the", "mother,", "a", "nervous", "invalid", "in", "the", "last", "few", "months", "of", "her", "life,", "she", "only", "wanted", "her", "girls", "to", "be", '"free,"', "and", "to", '"fulfil', 'themselves."'], text: 'As for the mother, a nervous invalid in the last few months of her life, she only wanted her girls to be "free," and to "fulfil themselves."' },
+  { words: ["She", "herself", "had", "never", "been", "able", "to", "be", "altogether", "herself:", "it", "had", "been", "denied", "her."], text: "She herself had never been able to be altogether herself: it had been denied her." },
+  { words: ["Heaven", "knows", "why,", "for", "she", "was", "a", "woman", "who", "had", "her", "own", "income", "and", "her", "own", "way."], text: "Heaven knows why, for she was a woman who had her own income and her own way." },
+  { words: ["She", "blamed", "her", "husband."], text: "She blamed her husband." },
+  { words: ["But", "as", "a", "matter", "of", "fact,", "it", "was", "some", "old", "impression", "of", "authority", "on", "her", "own", "mind", "or", "soul", "that", "she", "could", "not", "get", "rid", "of."], text: "But as a matter of fact, it was some old impression of authority on her own mind or soul that she could not get rid of." },
+  { words: ["It", "had", "nothing", "to", "do", "with", "Sir", "Malcolm,", "who", "left", "his", "nervously", "hostile,", "high-spirited", "wife", "to", "rule", "her", "own", "roost,", "while", "he", "went", "his", "own", "way."], text: "It had nothing to do with Sir Malcolm, who left his nervously hostile, high-spirited wife to rule her own roost, while he went his own way." },
+  { words: ["So", "the", "girls", "were", '"free,"', "and", "went", "back", "to", "Dresden,", "and", "their", "music,", "and", "the", "university", "and", "the", "young", "men."], text: 'So the girls were "free," and went back to Dresden, and their music, and the university and the young men.' },
+  { words: ["They", "loved", "their", "respective", "young", "men,", "and", "their", "respective", "young", "men", "loved", "them", "with", "all", "the", "passion", "of", "mental", "attraction."], text: "They loved their respective young men, and their respective young men loved them with all the passion of mental attraction." },
+  { words: ["All", "the", "wonderful", "things", "the", "young", "men", "thought", "and", "expressed", "and", "wrote,", "they", "thought", "and", "expressed", "and", "wrote", "for", "the", "young", "women."], text: "All the wonderful things the young men thought and expressed and wrote, they thought and expressed and wrote for the young women." },
+  { words: ["Connie's", "young", "man", "was", "musical,", "Hilda's", "was", "technical."], text: "Connie's young man was musical, Hilda's was technical." },
+  { words: ["But", "they", "simply", "lived", "for", "their", "young", "women."], text: "But they simply lived for their young women." },
+  { words: ["In", "their", "minds", "and", "their", "mental", "excitements,", "that", "is."], text: "In their minds and their mental excitements, that is." },
+  { words: ["Somewhere", "else", "they", "were", "a", "little", "rebuffed,", "though", "they", "did", "not", "know", "it."], text: "Somewhere else they were a little rebuffed, though they did not know it." },
+  { words: ["It", "was", "obvious", "in", "them", "too", "that", "love", "had", "gone", "through", "them:", "that", "is,", "the", "physical", "experience."], text: "It was obvious in them too that love had gone through them: that is, the physical experience." },
+  { words: ["It", "is", "curious", "what", "a", "subtle", "but", "unmistakable", "transmutation", "it", "makes,", "both", "in", "the", "body", "of", "men", "and", "women:", "the", "woman", "more", "blooming,", "more", "subtly", "rounded,", "her", "young", "angularities", "softened,", "and", "her", "expression", "either", "anxious", "or", "triumphant:", "the", "man", "much", "quieter,", "more", "inward,", "the", "very", "shapes", "of", "his", "shoulders", "and", "his", "buttocks", "less", "assertive,", "more", "hesitant."], text: "It is curious what a subtle but unmistakable transmutation it makes, both in the body of men and women: the woman more blooming, more subtly rounded, her young angularities softened, and her expression either anxious or triumphant: the man much quieter, more inward, the very shapes of his shoulders and his buttocks less assertive, more hesitant." },
+  { words: ["In", "the", "actual", "sex-thrill", "within", "the", "body,", "the", "sisters", "nearly", "succumbed", "to", "the", "strange", "male", "power."], text: "In the actual sex-thrill within the body, the sisters nearly succumbed to the strange male power." },
+  { words: ["But", "quickly", "they", "recovered", "themselves,", "took", "the", "sex-thrill", "as", "a", "sensation,", "and", "remained", "free."], text: "But quickly they recovered themselves, took the sex-thrill as a sensation, and remained free." },
+  { words: ["Whereas", "the", "men,", "in", "gratitude", "to", "the", "women", "for", "the", "sex", "experience,", "let", "their", "souls", "go", "out", "to", "her."], text: "Whereas the men, in gratitude to the women for the sex experience, let their souls go out to her." },
+  { words: ["And", "afterwards", "looked", "rather", "as", "if", "they", "had", "lost", "a", "shilling", "and", "found", "sixpence."], text: "And afterwards looked rather as if they had lost a shilling and found sixpence." },
+  { words: ["Connie's", "man", "could", "be", "a", "bit", "sulky,", "and", "Hilda's", "a", "bit", "jeering."], text: "Connie's man could be a bit sulky, and Hilda's a bit jeering." },
+  { words: ["But", "that", "is", "how", "men", "are!"], text: "But that is how men are!" },
+  { words: ["Ungrateful", "and", "never", "satisfied."], text: "Ungrateful and never satisfied." },
+  { words: ["When", "you", "don't", "have", "them", "they", "hate", "you", "because", "you", "won't;", "and", "when", "you", "do", "have", "them", "they", "hate", "you", "again,", "for", "some", "other", "reason."], text: "When you don't have them they hate you because you won't; and when you do have them they hate you again, for some other reason." },
+  { words: ["Or", "for", "no", "reason", "at", "all,", "except", "that", "they", "are", "discontented", "children,", "and", "can't", "be", "satisfied", "whatever", "they", "get,", "let", "a", "woman", "do", "what", "she", "may."], text: "Or for no reason at all, except that they are discontented children, and can't be satisfied whatever they get, let a woman do what she may." },
+  { words: ["However,", "came", "the", "war,", "Hilda", "and", "Connie", "were", "rushed", "home", "again", "after", "having", "been", "home", "already", "in", "May,", "to", "their", "mother's", "funeral."], text: "However, came the war, Hilda and Connie were rushed home again after having been home already in May, to their mother's funeral." },
+  { words: ["Before", "Christmas", "of", "1914", "both", "their", "German", "young", "men", "were", "dead:", "whereupon", "the", "sisters", "wept,", "and", "loved", "the", "young", "men", "passionately,", "but", "underneath", "forgot", "them."], text: "Before Christmas of 1914 both their German young men were dead: whereupon the sisters wept, and loved the young men passionately, but underneath forgot them." },
+  { words: ["They", "didn't", "exist", "any", "more."], text: "They didn't exist any more." },
+  { words: ["Both", "sisters", "lived", "in", "their", "father's,", "really", "their", "mother's", "Kensington", "house,", "and", "mixed", "with", "the", "young", "Cambridge", "group,", "the", "group", "that", "stood", "for", '"freedom"', "and", "flannel", "trousers,", "and", "flannel", "shirts", "open", "at", "the", "neck,", "and", "a", "well-bred", "sort", "of", "emotional", "anarchy,", "and", "a", "whispering,", "murmuring", "sort", "of", "voice,", "and", "an", "ultra-sensitive", "sort", "of", "manner."], text: `Both sisters lived in their father's, really their mother's Kensington house, and mixed with the young Cambridge group, the group that stood for "freedom" and flannel trousers, and flannel shirts open at the neck, and a well-bred sort of emotional anarchy, and a whispering, murmuring sort of voice, and an ultra-sensitive sort of manner.` },
+  { words: ["Hilda,", "however,", "suddenly", "married", "a", "man", "ten", "years", "older", "than", "herself,", "an", "elder", "member", "of", "the", "same", "Cambridge", "group,", "a", "man", "with", "a", "fair", "amount", "of", "money,", "and", "a", "comfortable", "family", "job", "in", "the", "government:", "he", "also", "wrote", "philosophical", "essays."], text: "Hilda, however, suddenly married a man ten years older than herself, an elder member of the same Cambridge group, a man with a fair amount of money, and a comfortable family job in the government: he also wrote philosophical essays." },
+  { words: ["She", "lived", "with", "him", "in", "a", "smallish", "house", "in", "Westminster,", "and", "moved", "in", "that", "good", "sort", "of", "society", "of", "people", "in", "the", "government", "who", "are", "not", "tip-toppers,", "but", "who", "are,", "or", "would", "be,", "the", "real", "intelligent", "power", "in", "the", "nation:", "people", "who", "know", "what", "they're", "talking", "about,", "or", "talk", "as", "if", "they", "did."], text: "She lived with him in a smallish house in Westminster, and moved in that good sort of society of people in the government who are not tip-toppers, but who are, or would be, the real intelligent power in the nation: people who know what they're talking about, or talk as if they did." },
+  { words: ["Connie", "did", "a", "mild", "form", "of", "war-work,", "and", "consorted", "with", "the", "flannel-trousers", "Cambridge", "intransigeants,", "who", "gently", "mocked", "at", "everything,", "so", "far."], text: "Connie did a mild form of war-work, and consorted with the flannel-trousers Cambridge intransigeants, who gently mocked at everything, so far." },
+  { words: ["Her", '"friend"', "was", "a", "Clifford", "Chatterley,", "a", "young", "man", "of", "twenty-two,", "who", "had", "hurried", "home", "from", "Bonn,", "where", "he", "was", "studying", "the", "technicalities", "of", "coal-mining."], text: 'Her "friend" was a Clifford Chatterley, a young man of twenty-two, who had hurried home from Bonn, where he was studying the technicalities of coal-mining.' },
+  { words: ["He", "had", "previously", "spent", "two", "years", "at", "Cambridge."], text: "He had previously spent two years at Cambridge." },
+  { words: ["Now", "he", "had", "become", "a", "first", "lieutenant", "in", "a", "smart", "regiment,", "so", "he", "could", "mock", "at", "everything", "more", "becomingly", "in", "uniform."], text: "Now he had become a first lieutenant in a smart regiment, so he could mock at everything more becomingly in uniform." },
+  { words: ["Clifford", "Chatterley", "was", "more", "upper-class", "than", "Connie."], text: "Clifford Chatterley was more upper-class than Connie." },
+  { words: ["Connie", "was", "well-to-do", "intelligentsia,", "but", "he", "was", "aristocracy."], text: "Connie was well-to-do intelligentsia, but he was aristocracy." },
+  { words: ["Not", "the", "big", "sort,", "but", "still", "it."], text: "Not the big sort, but still it." },
+  { words: ["His", "father", "was", "a", "baronet,", "and", "his", "mother", "had", "been", "a", "viscount's", "daughter."], text: "His father was a baronet, and his mother had been a viscount's daughter." },
+  { words: ["But", "Clifford,", "while", "he", "was", "better", "bred", "than", "Connie,", "and", "more", '"society,"', "was", "in", "his", "own", "way", "more", "provincial", "and", "more", "timid."], text: 'But Clifford, while he was better bred than Connie, and more "society," was in his own way more provincial and more timid.' },
+  { words: ["He", "was", "at", "his", "ease", "in", "the", "narrow", '"great', 'world,"', "that", "is,", "landed", "aristocracy", "society,", "but", "he", "was", "shy", "and", "nervous", "of", "all", "that", "other", "big", "world", "which", "consists", "of", "the", "vast", "hordes", "of", "the", "middle", "and", "lower", "classes,", "and", "foreigners."], text: 'He was at his ease in the narrow "great world," that is, landed aristocracy society, but he was shy and nervous of all that other big world which consists of the vast hordes of the middle and lower classes, and foreigners.' },
+  { words: ["If", "the", "truth", "must", "be", "told,", "he", "was", "just", "a", "little", "bit", "frightened", "of", "middle", "and", "lower", "class", "humanity,", "and", "of", "foreigners", "not", "of", "his", "own", "class."], text: "If the truth must be told, he was just a little bit frightened of middle and lower class humanity, and of foreigners not of his own class." },
+  { words: ["He", "was,", "in", "some", "paralysing", "way,", "conscious", "of", "his", "own", "defencelessness,", "though", "he", "had", "all", "the", "defence", "of", "privilege."], text: "He was, in some paralysing way, conscious of his own defencelessness, though he had all the defence of privilege." },
+  { words: ["Which", "is", "curious,", "but", "a", "phenomenon", "of", "our", "day."], text: "Which is curious, but a phenomenon of our day." },
+  { words: ["Therefore", "the", "peculiar", "soft", "assurance", "of", "a", "girl", "like", "Constance", "Reid", "fascinated", "him."], text: "Therefore the peculiar soft assurance of a girl like Constance Reid fascinated him." },
+  { words: ["She", "was", "so", "much", "more", "mistress", "of", "herself", "in", "that", "outer", "world", "of", "chaos", "than", "he", "was", "master", "of", "himself."], text: "She was so much more mistress of herself in that outer world of chaos than he was master of himself." },
+  { words: ["Nevertheless", "he", "too", "was", "a", "rebel:", "rebelling", "even", "against", "his", "class."], text: "Nevertheless he too was a rebel: rebelling even against his class." },
+  { words: ["Or", "perhaps", "rebel", "is", "too", "strong", "a", "word;", "far", "too", "strong."], text: "Or perhaps rebel is too strong a word; far too strong." },
+  { words: ["He", "was", "only", "caught", "in", "the", "general,", "popular", "recoil", "of", "the", "young", "against", "convention", "and", "against", "any", "sort", "of", "real", "authority."], text: "He was only caught in the general, popular recoil of the young against convention and against any sort of real authority." },
+  { words: ["Fathers", "were", "ridiculous:", "his", "own", "obstinate", "one", "supremely", "so."], text: "Fathers were ridiculous: his own obstinate one supremely so." },
+  { words: ["And", "governments", "were", "ridiculous:", "our", "own", "wait-and-see", "sort", "especially", "so."], text: "And governments were ridiculous: our own wait-and-see sort especially so." },
+  { words: ["And", "armies", "were", "ridiculous,", "and", "old", "duffers", "of", "generals", "altogether,", "the", "red-faced", "Kitchener", "supremely."], text: "And armies were ridiculous, and old duffers of generals altogether, the red-faced Kitchener supremely." },
+  { words: ["Even", "the", "war", "was", "ridiculous,", "though", "it", "did", "kill", "rather", "a", "lot", "of", "people."], text: "Even the war was ridiculous, though it did kill rather a lot of people." },
+  { words: ["In", "fact", "everything", "was", "a", "little", "ridiculous,", "or", "very", "ridiculous:", "certainly", "everything", "connected", "with", "authority,", "whether", "it", "were", "in", "the", "army", "or", "the", "government", "or", "the", "universities,", "was", "ridiculous", "to", "a", "degree."], text: "In fact everything was a little ridiculous, or very ridiculous: certainly everything connected with authority, whether it were in the army or the government or the universities, was ridiculous to a degree." },
+  { words: ["And", "as", "far", "as", "the", "governing", "class", "made", "any", "pretensions", "to", "govern,", "they", "were", "ridiculous", "too."], text: "And as far as the governing class made any pretensions to govern, they were ridiculous too." },
+  { words: ["Sir", "Geoffrey,", "Clifford's", "father,", "was", "intensely", "ridiculous,", "chopping", "down", "his", "trees,", "and", "weeding", "men", "out", "of", "his", "colliery", "to", "shove", "them", "into", "the", "war;", "and", "himself", "being", "so", "safe", "and", "patriotic;", "but", "also,", "spending", "more", "money", "on", "his", "country", "than", "he'd", "got."], text: "Sir Geoffrey, Clifford's father, was intensely ridiculous, chopping down his trees, and weeding men out of his colliery to shove them into the war; and himself being so safe and patriotic; but also, spending more money on his country than he'd got." },
+  { words: ["When", "Miss", "Chatterley--Emma--came", "down", "to", "London", "from", "the", "Midlands", "to", "do", "some", "nursing", "work,", "she", "was", "very", "witty", "in", "a", "quiet", "way", "about", "Sir", "Geoffrey", "and", "his", "determined", "patriotism."], text: "When Miss Chatterley--Emma--came down to London from the Midlands to do some nursing work, she was very witty in a quiet way about Sir Geoffrey and his determined patriotism." },
+  { words: ["Herbert,", "the", "elder", "brother", "and", "heir,", "laughed", "outright,", "though", "it", "was", "his", "trees", "that", "were", "falling", "for", "trench", "props."], text: "Herbert, the elder brother and heir, laughed outright, though it was his trees that were falling for trench props." },
+  { words: ["But", "Clifford", "only", "smiled", "a", "little", "uneasily."], text: "But Clifford only smiled a little uneasily." },
+  { words: ["Everything", "was", "ridiculous,", "quite", "true."], text: "Everything was ridiculous, quite true." },
+  { words: ["But", "when", "it", "came", "too", "close", "and", "oneself", "became", "ridiculous", "too...?"], text: "But when it came too close and oneself became ridiculous too...?" },
+  { words: ["At", "least", "people", "of", "a", "different", "class,", "like", "Connie,", "were", "earnest", "about", "something."], text: "At least people of a different class, like Connie, were earnest about something." },
+  { words: ["They", "believed", "in", "something."], text: "They believed in something." },
+  { words: ["They", "were", "rather", "earnest", "about", "the", "Tommies,", "and", "the", "threat", "of", "conscription,", "and", "the", "shortage", "of", "sugar", "and", "toffee", "for", "the", "children."], text: "They were rather earnest about the Tommies, and the threat of conscription, and the shortage of sugar and toffee for the children." },
+  { words: ["In", "all", "these", "things,", "of", "course,", "the", "authorities", "were", "ridiculously", "at", "fault."], text: "In all these things, of course, the authorities were ridiculously at fault." },
+  { words: ["But", "Clifford", "could", "not", "take", "it", "to", "heart."], text: "But Clifford could not take it to heart." },
+  { words: ["To", "him", "the", "authorities", "were", "ridiculous", "ab", "ovo,", "not", "because", "of", "toffee", "or", "Tommies."], text: "To him the authorities were ridiculous ab ovo, not because of toffee or Tommies." },
+  { words: ["And", "the", "authorities", "felt", "ridiculous,", "and", "behaved", "in", "a", "rather", "ridiculous", "fashion,", "and", "it", "was", "all", "a", "mad", "hatter's", "tea", "party", "for", "a", "while."], text: "And the authorities felt ridiculous, and behaved in a rather ridiculous fashion, and it was all a mad hatter's tea party for a while." },
+  { words: ["Till", "things", "developed", "over", "there,", "and", "Lloyd", "George", "came", "to", "save", "the", "situation", "over", "here."], text: "Till things developed over there, and Lloyd George came to save the situation over here." },
+  { words: ["And", "this", "surpassed", "even", "ridicule,", "the", "flippant", "young", "laughed", "no", "more."], text: "And this surpassed even ridicule, the flippant young laughed no more." },
+  { words: ["In", "1916", "Herbert", "Chatterley", "was", "killed,", "so", "Clifford", "became", "heir."], text: "In 1916 Herbert Chatterley was killed, so Clifford became heir." },
+  { words: ["He", "was", "terrified", "even", "of", "this."], text: "He was terrified even of this." },
+  { words: ["His", "importance", "as", "son", "of", "Sir", "Geoffrey", "and", "child", "of", "Wragby", "was", "so", "ingrained", "in", "him,", "he", "could", "never", "escape", "it."], text: "His importance as son of Sir Geoffrey and child of Wragby was so ingrained in him, he could never escape it." },
+  { words: ["And", "yet", "he", "knew", "that", "this", "too,", "in", "the", "eyes", "of", "the", "vast", "seething", "world,", "was", "ridiculous."], text: "And yet he knew that this too, in the eyes of the vast seething world, was ridiculous." },
+  { words: ["Now", "he", "was", "heir", "and", "responsible", "for", "Wragby."], text: "Now he was heir and responsible for Wragby." },
+  { words: ["Was", "that", "not", "terrible?"], text: "Was that not terrible?" },
+  { words: ["And", "also", "splendid", "at", "the", "same", "time,", "perhaps,", "purely", "absurd?"], text: "And also splendid at the same time, perhaps, purely absurd?" },
+  { words: ["Sir", "Geoffrey", "would", "have", "none", "of", "the", "absurdity."], text: "Sir Geoffrey would have none of the absurdity." },
+  { words: ["He", "was", "pale", "and", "tense,", "withdrawn", "into", "himself,", "and", "obstinately", "determined", "to", "save", "his", "country", "and", "his", "own", "position,", "let", "it", "be", "Lloyd", "George", "or", "who", "it", "might."], text: "He was pale and tense, withdrawn into himself, and obstinately determined to save his country and his own position, let it be Lloyd George or who it might." },
+  { words: ["So", "cut", "off", "he", "was,", "so", "divorced", "from", "the", "England", "that", "was", "really", "England,", "so", "utterly", "incapable,", "that", "he", "even", "thought", "well", "of", "Horatio", "Bottomley."], text: "So cut off he was, so divorced from the England that was really England, so utterly incapable, that he even thought well of Horatio Bottomley." },
+  { words: ["Sir", "Geoffrey", "stood", "for", "England", "and", "Lloyd", "George", "as", "his", "forebears", "had", "stood", "for", "England", "and", "St.", "George:", "and", "he", "never", "knew", "there", "was", "a", "difference."], text: "Sir Geoffrey stood for England and Lloyd George as his forebears had stood for England and St. George: and he never knew there was a difference." },
+  { words: ["So", "Sir", "Geoffrey", "felled", "timber", "and", "stood", "for", "Lloyd", "George", "and", "England,", "England", "and", "Lloyd", "George."], text: "So Sir Geoffrey felled timber and stood for Lloyd George and England, England and Lloyd George." },
+  { words: ["And", "he", "wanted", "Clifford", "to", "marry", "and", "produce", "an", "heir."], text: "And he wanted Clifford to marry and produce an heir." },
+  { words: ["Clifford", "felt", "his", "father", "was", "a", "hopeless", "anachronism."], text: "Clifford felt his father was a hopeless anachronism." },
+  { words: ["But", "wherein", "was", "he", "himself", "any", "further", "ahead,", "except", "in", "a", "wincing", "sense", "of", "the", "ridiculousness", "of", "everything,", "and", "the", "paramount", "ridiculousness", "of", "his", "own", "position."], text: "But wherein was he himself any further ahead, except in a wincing sense of the ridiculousness of everything, and the paramount ridiculousness of his own position." },
+  { words: ["For", "willy-nilly", "he", "took", "his", "baronetcy", "and", "Wragby", "with", "the", "last", "seriousness."], text: "For willy-nilly he took his baronetcy and Wragby with the last seriousness." },
+  { words: ["The", "gay", "excitement", "had", "gone", "out", "of", "the", "war", "...", "dead."], text: "The gay excitement had gone out of the war ... dead." },
+  { words: ["Too", "much", "death", "and", "horror."], text: "Too much death and horror." },
+  { words: ["A", "man", "needed", "support", "and", "comfort."], text: "A man needed support and comfort." },
+  { words: ["A", "man", "needed", "to", "have", "an", "anchor", "in", "the", "safe", "world."], text: "A man needed to have an anchor in the safe world." },
+  { words: ["A", "man", "needed", "a", "wife."], text: "A man needed a wife." },
+  { words: ["The", "Chatterleys,", "two", "brothers", "and", "a", "sister,", "had", "lived", "curiously", "isolated,", "shut", "in", "with", "one", "another", "at", "Wragby,", "in", "spite", "of", "all", "their", "connections."], text: "The Chatterleys, two brothers and a sister, had lived curiously isolated, shut in with one another at Wragby, in spite of all their connections." },
+  { words: ["A", "sense", "of", "isolation", "intensified", "the", "family", "tie,", "a", "sense", "of", "the", "weakness", "of", "their", "position,", "a", "sense", "of", "defencelessness,", "in", "spite", "of,", "or", "because", "of", "the", "title", "and", "the", "land."], text: "A sense of isolation intensified the family tie, a sense of the weakness of their position, a sense of defencelessness, in spite of, or because of the title and the land." },
+  { words: ["They", "were", "cut", "off", "from", "those", "industrial", "Midlands", "in", "which", "they", "passed", "their", "lives."], text: "They were cut off from those industrial Midlands in which they passed their lives." },
+  { words: ["And", "they", "were", "cut", "off", "from", "their", "own", "class", "by", "the", "brooding,", "obstinate,", "shut-up", "nature", "of", "Sir", "Geoffrey,", "their", "father,", "whom", "they", "ridiculed,", "but", "whom", "they", "were", "so", "sensitive", "about."], text: "And they were cut off from their own class by the brooding, obstinate, shut-up nature of Sir Geoffrey, their father, whom they ridiculed, but whom they were so sensitive about." },
+  { words: ["The", "three", "had", "said", "they", "would", "all", "live", "together", "always."], text: "The three had said they would all live together always." },
+  { words: ["But", "now", "Herbert", "was", "dead,", "and", "Sir", "Geoffrey", "wanted", "Clifford", "to", "marry."], text: "But now Herbert was dead, and Sir Geoffrey wanted Clifford to marry." },
+  { words: ["Sir", "Geoffrey", "barely", "mentioned", "it:", "he", "spoke", "very", "little."], text: "Sir Geoffrey barely mentioned it: he spoke very little." },
+  { words: ["But", "his", "silent,", "brooding", "insistence", "that", "it", "should", "be", "so", "was", "hard", "for", "Clifford", "to", "bear", "up", "against."], text: "But his silent, brooding insistence that it should be so was hard for Clifford to bear up against." },
+  { words: ["But", "Emma", "said", "No!"], text: "But Emma said No!" },
+  { words: ["She", "was", "ten", "years", "older", "than", "Clifford,", "and", "she", "felt", "his", "marrying", "would", "be", "a", "desertion", "and", "a", "betrayal", "of", "what", "the", "young", "ones", "of", "the", "family", "had", "stood", "for."], text: "She was ten years older than Clifford, and she felt his marrying would be a desertion and a betrayal of what the young ones of the family had stood for." },
+  { words: ["Clifford", "married", "Connie,", "nevertheless,", "and", "had", "his", "month's", "honeymoon", "with", "her."], text: "Clifford married Connie, nevertheless, and had his month's honeymoon with her." },
+  { words: ["It", "was", "the", "terrible", "year", "1917,", "and", "they", "were", "intimate", "as", "two", "people", "who", "stand", "together", "on", "a", "sinking", "ship."], text: "It was the terrible year 1917, and they were intimate as two people who stand together on a sinking ship." },
+  { words: ["He", "had", "been", "virgin", "when", "he", "married:", "and", "the", "sex", "part", "did", "not", "mean", "much", "to", "him."], text: "He had been virgin when he married: and the sex part did not mean much to him." },
+  { words: ["They", "were", "so", "close,", "he", "and", "she,", "apart", "from", "that."], text: "They were so close, he and she, apart from that." },
+  { words: ["And", "Connie", "exulted", "a", "little", "in", "this", "intimacy", "which", "was", "beyond", "sex,", "and", "beyond", "a", "man's", '"satisfaction."'], text: `And Connie exulted a little in this intimacy which was beyond sex, and beyond a man's "satisfaction."` },
+  { words: ["Clifford", "anyhow", "was", "not", "just", "keen", "on", "his", '"satisfaction,"', "as", "so", "many", "men", "seemed", "to", "be."], text: 'Clifford anyhow was not just keen on his "satisfaction," as so many men seemed to be.' },
+  { words: ["No,", "the", "intimacy", "was", "deeper,", "more", "personal", "than", "that."], text: "No, the intimacy was deeper, more personal than that." },
+  { words: ["And", "sex", "was", "merely", "an", "accident,", "or", "an", "adjunct:", "one", "of", "the", "curious", "obsolete,", "organic", "processes", "which", "persisted", "in", "its", "own", "clumsiness,", "but", "was", "not", "really", "necessary."], text: "And sex was merely an accident, or an adjunct: one of the curious obsolete, organic processes which persisted in its own clumsiness, but was not really necessary." },
+  { words: ["Though", "Connie", "did", "want", "children:", "if", "only", "to", "fortify", "her", "against", "her", "sister-in-law", "Emma."], text: "Though Connie did want children: if only to fortify her against her sister-in-law Emma." },
+  { words: ["But", "early", "in", "1918", "Clifford", "was", "shipped", "home", "smashed,", "and", "there", "was", "no", "child."], text: "But early in 1918 Clifford was shipped home smashed, and there was no child." },
+  { words: ["And", "Sir", "Geoffrey", "died", "of", "chagrin."], text: "And Sir Geoffrey died of chagrin." },
+  { words: ["CHAPTER", "II", "Connie", "and", "Clifford", "came", "home", "to", "Wragby", "in", "the", "autumn", "of", "1920.", "Miss", "Chatterley,", "still", "disgusted", "at", "her", "brother's", "defection,", "had", "departed", "and", "was", "living", "in", "a", "little", "flat", "in", "London."], text: "CHAPTER II Connie and Clifford came home to Wragby in the autumn of 1920. Miss Chatterley, still disgusted at her brother's defection, had departed and was living in a little flat in London." },
+  { words: ["Wragby", "was", "a", "long", "low", "old", "house", "in", "brown", "stone,", "begun", "about", "the", "middle", "of", "the", "eighteenth", "century,", "and", "added", "on", "to,", "till", "it", "was", "a", "warren", "of", "a", "place", "without", "much", "distinction."], text: "Wragby was a long low old house in brown stone, begun about the middle of the eighteenth century, and added on to, till it was a warren of a place without much distinction." },
+  { words: ["It", "stood", "on", "an", "eminence", "in", "a", "rather", "fine", "old", "park", "of", "oak", "trees,", "but", "alas,", "one", "could", "see", "in", "the", "near", "distance", "the", "chimney", "of", "Tevershall", "pit,", "with", "its", "clouds", "of", "steam", "and", "smoke,", "and", "on", "the", "damp,", "hazy", "distance", "of", "the", "hill", "the", "raw", "straggle", "of", "Tevershall", "village,", "a", "village", "which", "began", "almost", "at", "the", "park", "gates,", "and", "trailed", "in", "utter", "hopeless", "ugliness", "for", "a", "long", "and", "gruesome", "mile:", "houses,", "rows", "of", "wretched,", "small,", "begrimed,", "brick", "houses,", "with", "black", "slate", "roofs", "for", "lids,", "sharp", "angles", "and", "wilful,", "blank", "dreariness."], text: "It stood on an eminence in a rather fine old park of oak trees, but alas, one could see in the near distance the chimney of Tevershall pit, with its clouds of steam and smoke, and on the damp, hazy distance of the hill the raw straggle of Tevershall village, a village which began almost at the park gates, and trailed in utter hopeless ugliness for a long and gruesome mile: houses, rows of wretched, small, begrimed, brick houses, with black slate roofs for lids, sharp angles and wilful, blank dreariness." },
+  { words: ["Connie", "was", "accustomed", "to", "Kensington", "or", "the", "Scotch", "hills", "or", "the", "Sussex", "downs:", "that", "was", "her", "England."], text: "Connie was accustomed to Kensington or the Scotch hills or the Sussex downs: that was her England." },
+  { words: ["With", "the", "stoicism", "of", "the", "young", "she", "took", "in", "the", "utter,", "soulless", "ugliness", "of", "the", "coal-and-iron", "Midlands", "at", "a", "glance,", "and", "left", "it", "at", "what", "it", "was:", "unbelievable", "and", "not", "to", "be", "thought", "about."], text: "With the stoicism of the young she took in the utter, soulless ugliness of the coal-and-iron Midlands at a glance, and left it at what it was: unbelievable and not to be thought about." },
+  { words: ["From", "the", "rather", "dismal", "rooms", "at", "Wragby", "she", "heard", "the", "rattle-rattle", "of", "the", "screens", "at", "the", "pit,", "the", "puff", "of", "the", "winding-engine,", "the", "clink-clink", "of", "shunting", "trucks,", "and", "the", "hoarse", "little", "whistle", "of", "the", "colliery", "locomotives."], text: "From the rather dismal rooms at Wragby she heard the rattle-rattle of the screens at the pit, the puff of the winding-engine, the clink-clink of shunting trucks, and the hoarse little whistle of the colliery locomotives." },
+  { words: ["Tevershall", "pit-bank", "was", "burning,", "had", "been", "burning", "for", "years,", "and", "it", "would", "cost", "thousands", "to", "put", "it", "out."], text: "Tevershall pit-bank was burning, had been burning for years, and it would cost thousands to put it out." },
+  { words: ["So", "it", "had", "to", "burn."], text: "So it had to burn." },
+  { words: ["And", "when", "the", "wind", "was", "that", "way,", "which", "was", "often,", "the", "house", "was", "full", "of", "the", "stench", "of", "this", "sulphureous", "combustion", "of", "the", "earth's", "excrement."], text: "And when the wind was that way, which was often, the house was full of the stench of this sulphureous combustion of the earth's excrement." },
+  { words: ["But", "even", "on", "windless", "days", "the", "air", "always", "smelt", "of", "something", "under-earth:", "sulphur,", "iron,", "coal,", "or", "acid."], text: "But even on windless days the air always smelt of something under-earth: sulphur, iron, coal, or acid." },
+  { words: ["And", "even", "on", "the", "Christmas", "roses", "the", "smuts", "settled", "persistently,", "incredible,", "like", "black", "manna", "from", "skies", "of", "doom."], text: "And even on the Christmas roses the smuts settled persistently, incredible, like black manna from skies of doom." },
+  { words: ["Well,", "there", "it", "was:", "fated", "like", "the", "rest", "of", "things!"], text: "Well, there it was: fated like the rest of things!" },
+  { words: ["It", "was", "rather", "awful,", "but", "why", "kick?"], text: "It was rather awful, but why kick?" },
+  { words: ["You", "couldn't", "kick", "it", "away."], text: "You couldn't kick it away." },
+  { words: ["It", "just", "went", "on."], text: "It just went on." },
+  { words: ["Life,", "like", "all", "the", "rest!"], text: "Life, like all the rest!" },
+  { words: ["On", "the", "low", "dark", "ceiling", "of", "cloud", "at", "night", "red", "blotches", "burned", "and", "quavered,", "dappling", "and", "swelling", "and", "contracting,", "like", "burns", "that", "give", "pain."], text: "On the low dark ceiling of cloud at night red blotches burned and quavered, dappling and swelling and contracting, like burns that give pain." },
+  { words: ["It", "was", "the", "furnaces."], text: "It was the furnaces." },
+  { words: ["At", "first", "they", "fascinated", "Connie", "with", "a", "sort", "of", "horror;", "she", "felt", "she", "was", "living", "underground."], text: "At first they fascinated Connie with a sort of horror; she felt she was living underground." },
+  { words: ["Then", "she", "got", "used", "to", "them."], text: "Then she got used to them." },
+  { words: ["And", "in", "the", "morning", "it", "rained."], text: "And in the morning it rained." },
+  { words: ["Clifford", "professed", "to", "like", "Wragby", "better", "than", "London."], text: "Clifford professed to like Wragby better than London." },
+  { words: ["This", "country", "had", "a", "grim", "will", "of", "its", "own,", "and", "the", "people", "had", "guts."], text: "This country had a grim will of its own, and the people had guts." },
+  { words: ["Connie", "wondered", "what", "else", "they", "had:", "certainly", "neither", "eyes", "nor", "minds."], text: "Connie wondered what else they had: certainly neither eyes nor minds." },
+  { words: ["The", "people", "were", "as", "haggard,", "shapeless,", "and", "dreary", "as", "the", "countryside,", "and", "as", "unfriendly."], text: "The people were as haggard, shapeless, and dreary as the countryside, and as unfriendly." },
+  { words: ["Only", "there", "was", "something", "in", "their", "deep-mouthed", "slurring", "of", "the", "dialect,", "and", "the", "thresh-thresh", "of", "their", "hobnailed", "pit-boots", "as", "they", "trailed", "home", "in", "gangs", "on", "the", "asphalt", "from", "work,", "that", "was", "terrible", "and", "a", "bit", "mysterious."], text: "Only there was something in their deep-mouthed slurring of the dialect, and the thresh-thresh of their hobnailed pit-boots as they trailed home in gangs on the asphalt from work, that was terrible and a bit mysterious." },
+  { words: ["There", "had", "been", "no", "welcome", "home", "for", "the", "young", "squire,", "no", "festivities,", "no", "deputation,", "not", "even", "a", "single", "flower."], text: "There had been no welcome home for the young squire, no festivities, no deputation, not even a single flower." },
+  { words: ["Only", "a", "dank", "ride", "in", "a", "motorcar", "up", "a", "dark,", "damp", "drive,", "burrowing", "through", "gloomy", "trees,", "out", "to", "the", "slope", "of", "the", "park", "where", "grey", "damp", "sheep", "were", "feeding,", "to", "the", "knoll", "where", "the", "house", "spread", "its", "dark", "brown", "façade,", "and", "the", "housekeeper", "and", "her", "husband", "were", "hovering,", "like", "unsure", "tenants", "on", "the", "face", "of", "the", "earth,", "ready", "to", "stammer", "a", "welcome."], text: "Only a dank ride in a motorcar up a dark, damp drive, burrowing through gloomy trees, out to the slope of the park where grey damp sheep were feeding, to the knoll where the house spread its dark brown façade, and the housekeeper and her husband were hovering, like unsure tenants on the face of the earth, ready to stammer a welcome." },
+  { words: ["There", "was", "no", "communication", "between", "Wragby", "Hall", "and", "Tevershall", "village,", "none."], text: "There was no communication between Wragby Hall and Tevershall village, none." },
+  { words: ["No", "caps", "were", "touched,", "no", "curtseys", "bobbed.", "The", "colliers"], text: "No caps were touched, no curtseys bobbed. The colliers" }
+];
 var sceneTextMap = {
   castle: castleWords,
   scifi: scifiWords,
@@ -25524,14 +26467,28 @@ var sceneTextMap = {
   crime: crimeWords,
   steamy: steamyWords
 };
+var sceneSentenceMap = {
+  castle: castleSentences,
+  scifi: scifiSentences,
+  romance: romanceSentences,
+  fantasy: fantasySentences,
+  crime: crimeSentences,
+  steamy: steamySentences
+};
 
 // pages/demos/inkfield-genesis/index.ts
 var FONT_FAMILY = '"Readex Pro", "Helvetica Neue", Helvetica, Arial, sans-serif';
 var FONT = `400 9px ${FONT_FAMILY}`;
+var BOOK_FONT_FAMILY = 'Georgia, "Iowan Old Style", "Palatino Linotype", Palatino, serif';
+var TOOLTIP_FONT_SIZE = 13;
+var TOOLTIP_FONT = `italic 400 ${TOOLTIP_FONT_SIZE}px ${BOOK_FONT_FAMILY}`;
+var TOOLTIP_HIGHLIGHT_FONT = `italic 700 ${TOOLTIP_FONT_SIZE}px ${BOOK_FONT_FAMILY}`;
+var TOOLTIP_LINE_HEIGHT = TOOLTIP_FONT_SIZE + 7;
 var SCENE_HOLD = 8;
 var SCENE_FADE = 1.2;
 var TOTAL_SCENE = SCENE_HOLD + SCENE_FADE;
 var TOOLTIP_TIMEOUT = 5;
+var TOOLTIP_MAX_W_PX = 420;
 var canvas = document.getElementById("c");
 var ctx = canvas.getContext("2d");
 var W = 0;
@@ -25547,10 +26504,14 @@ var scrollX = 0;
 var scrollSpeed = 0;
 var scrollDir = 0;
 var grid = [];
+var sentences = [];
 var mouseCol = -1;
 var mouseRow = -1;
 var lastInteractionTime = 0;
 var tooltipOpacity = 0;
+var tooltipSentenceIdx = -1;
+var tooltipX = 0;
+var tooltipY = 0;
 var currentScene = 0;
 var sceneTime = 0;
 var fadeIn = 0;
@@ -25601,6 +26562,7 @@ function pickScrollMode() {
 function buildGrid(sceneIndex) {
   const scene = scenes[sceneIndex % scenes.length];
   const words = sceneTextMap[scene.name] ?? ["story"];
+  sentences = sceneSentenceMap[scene.name] ?? [{ words: ["story"], text: "story" }];
   rows = scene.rows;
   cols = scene.cols;
   cellSize = H / rows;
@@ -25611,15 +26573,27 @@ function buildGrid(sceneIndex) {
   offsetY = 0;
   pickScrollMode();
   grid = [];
-  let wordIdx = 0;
+  let globalWordIdx = 0;
+  let sentenceIdx = 0;
+  let wordInSentence = 0;
   for (let r = 0;r < rows; r++) {
     const row = [];
     for (let c = 0;c < cols; c++) {
       const srcCol = Math.floor(c / cols * scene.cols);
       const srcRow = Math.floor(r / rows * scene.rows);
       const srcIdx = (srcRow * scene.cols + srcCol) * 3;
-      const text = words[wordIdx % words.length];
-      wordIdx++;
+      const wrappedIdx = globalWordIdx % words.length;
+      const text = words[wrappedIdx];
+      let si = 0;
+      let wi = wrappedIdx;
+      while (si < sentences.length && wi >= sentences[si].words.length) {
+        wi -= sentences[si].words.length;
+        si++;
+      }
+      if (si >= sentences.length) {
+        si = 0;
+        wi = 0;
+      }
       const prepared = prepareWithSegments(text, FONT);
       const measuredWidth = prepared.widths.reduce((s, w) => s + w, 0);
       row.push({
@@ -25627,13 +26601,18 @@ function buildGrid(sceneIndex) {
         measuredWidth,
         r: scene.colors[srcIdx],
         g: scene.colors[srcIdx + 1],
-        b: scene.colors[srcIdx + 2]
+        b: scene.colors[srcIdx + 2],
+        sentenceIdx: si,
+        wordInSentence: wi
       });
+      globalWordIdx++;
     }
     grid.push(row);
   }
   fadeIn = 0;
   tooltipOpacity = 0;
+  tooltipSentenceIdx = -1;
+  lastInteractionTime = 0;
   const attrEl = document.getElementById("attribution");
   if (attrEl) {
     attrEl.textContent = attributions[scene.name] ?? "";
@@ -25680,6 +26659,70 @@ function update(dt, now) {
     document.getElementById("wordmark")?.classList.add("visible");
   }
 }
+function renderSentenceTooltip(cell, cx, cy, alpha) {
+  const sentence = sentences[cell.sentenceIdx];
+  if (sentence === undefined)
+    return;
+  const ta = alpha * tooltipOpacity;
+  const maxWidth = Math.min(TOOLTIP_MAX_W_PX, W - 24);
+  const padX = 16;
+  const padY = 12;
+  const prepared = prepareWithSegments(sentence.text, TOOLTIP_FONT);
+  const layout = layoutWithLines(prepared, maxWidth - padX * 2, TOOLTIP_LINE_HEIGHT);
+  const textW = layout.lines.reduce((max, line) => Math.max(max, line.width), 0);
+  const boxW = textW + padX * 2;
+  const boxH = layout.height + padY * 2;
+  const isMobile = "ontouchstart" in window;
+  const tooltipOffset = isMobile ? 60 : 14;
+  let boxX = cx - boxW / 2;
+  let boxY = cy - boxH - tooltipOffset;
+  if (boxX < 6)
+    boxX = 6;
+  if (boxX + boxW > W - 6)
+    boxX = W - boxW - 6;
+  if (boxY < 6) {
+    boxY = cy + cellSize + 8;
+  }
+  ctx.fillStyle = `rgba(12, 10, 8, ${ta * 0.82})`;
+  ctx.beginPath();
+  ctx.roundRect(boxX, boxY, boxW, boxH, 4);
+  ctx.fill();
+  ctx.strokeStyle = `rgba(180, 160, 120, ${ta * 0.12})`;
+  ctx.lineWidth = 0.5;
+  ctx.beginPath();
+  ctx.roundRect(boxX + 1, boxY + 1, boxW - 2, boxH - 2, 3);
+  ctx.stroke();
+  const targetWord = cell.text;
+  let lineY = boxY + padY + TOOLTIP_FONT_SIZE * 0.55;
+  let highlighted = false;
+  for (const line of layout.lines) {
+    const lineWords = line.text.split(/(\s+)/);
+    let drawX = boxX + padX;
+    for (const fragment of lineWords) {
+      if (fragment.trim().length === 0) {
+        ctx.font = TOOLTIP_FONT;
+        drawX += ctx.measureText(fragment).width;
+        continue;
+      }
+      const stripped = fragment.replace(/^[^a-zA-Z0-9]*|[^a-zA-Z0-9]*$/g, "");
+      const targetStripped = targetWord.replace(/^[^a-zA-Z0-9]*|[^a-zA-Z0-9]*$/g, "");
+      const isTarget = !highlighted && stripped === targetStripped;
+      if (isTarget) {
+        ctx.font = TOOLTIP_HIGHLIGHT_FONT;
+        ctx.fillStyle = `rgba(255, 235, 190, ${ta})`;
+        highlighted = true;
+      } else {
+        ctx.font = TOOLTIP_FONT;
+        ctx.fillStyle = `rgba(190, 180, 165, ${ta * 0.75})`;
+      }
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillText(fragment, drawX, lineY);
+      drawX += ctx.measureText(fragment).width;
+    }
+    lineY += TOOLTIP_LINE_HEIGHT;
+  }
+}
 function render() {
   ctx.clearRect(0, 0, W, H);
   ctx.fillStyle = "#050508";
@@ -25710,41 +26753,14 @@ function render() {
     const cell = grid[mouseRow][mouseCol];
     const cx = sx + mouseCol * cellSize + cellSize / 2;
     const cy = offsetY + mouseRow * cellSize + cellSize / 2;
-    const padding = 6;
-    const fontSize = 16;
-    ctx.font = `400 ${fontSize}px ${FONT_FAMILY}`;
-    const textWidth = ctx.measureText(cell.text).width;
-    const boxW = textWidth + padding * 2;
-    const boxH = fontSize + padding * 2;
-    const isMobile = "ontouchstart" in window;
-    const tooltipOffset = isMobile ? 60 : 8;
-    let boxX = cx - boxW / 2;
-    let boxY = cy - boxH - tooltipOffset;
-    if (boxX < 2)
-      boxX = 2;
-    if (boxX + boxW > W - 2)
-      boxX = W - boxW - 2;
-    if (boxY < 2)
-      boxY = 2;
-    if (boxY + boxH > H - 2)
-      boxY = H - boxH - 2;
-    const ta = alpha * tooltipOpacity;
-    ctx.fillStyle = `rgba(0, 0, 0, ${ta * 0.55})`;
-    ctx.beginPath();
-    ctx.roundRect(boxX, boxY, boxW, boxH, 4);
-    ctx.fill();
-    ctx.strokeStyle = `rgba(${cell.r},${cell.g},${cell.b},${ta * 0.5})`;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.roundRect(boxX, boxY, boxW, boxH, 4);
-    ctx.stroke();
-    const cr = Math.min(255, cell.r + 80);
-    const cg = Math.min(255, cell.g + 80);
-    const cb = Math.min(255, cell.b + 80);
-    ctx.fillStyle = `rgba(${cr},${cg},${cb},${ta})`;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(cell.text, boxX + boxW / 2, boxY + boxH / 2);
+    if (cell.sentenceIdx !== tooltipSentenceIdx) {
+      tooltipSentenceIdx = cell.sentenceIdx;
+      tooltipX = cx;
+      tooltipY = cy;
+    }
+    renderSentenceTooltip(cell, tooltipX, tooltipY, alpha);
+  } else if (tooltipOpacity <= 0.01) {
+    tooltipSentenceIdx = -1;
   }
 }
 var lastTime = 0;
