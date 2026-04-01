@@ -155,16 +155,25 @@
           { pause: 600 },
           { type: 'fans. just fans.', hold: LONG_HOLD },
         ],
-        // 5. The fake-out
+        // 5. The agent reversal — mic drop
         [
-          { type: 'authors find ', speed: TYPE_SPEED },
-          { type: 'their car keys', speed: TYPE_SPEED },
+          { type: 'authors chase agents', speed: TYPE_SPEED },
+          { pause: 1500 },
+          { delete: 19, speed: DELETE_SPEED },
+          { pause: 600 },
+          { type: 'agents chase authors', speed: TYPE_SPEED },
           { pause: 1000 },
-          { delete: 14, speed: DELETE_SPEED },
-          { pause: 400 },
-          { type: 'agents', hold: LONG_HOLD },
+          { type: '  ...yes, really', speed: SLOW_TYPE, hold: LONG_HOLD },
         ],
-        // 6. Writer's struggle
+        // 6. The royalty flip
+        [
+          { type: '10% royalties become ', speed: TYPE_SPEED },
+          { pause: 800 },
+          { delete: 21, speed: DELETE_SPEED },
+          { pause: 400 },
+          { type: '100% royalties become the standard', hold: LONG_HOLD },
+        ],
+        // 7. Writer's struggle
         [
           { type: 'the first draft becomes ', speed: TYPE_SPEED },
           { type: 'a masterpiece', speed: TYPE_SPEED },
@@ -177,7 +186,11 @@
           { pause: 300 },
           { type: 'the second draft', hold: LONG_HOLD },
         ],
-        // 7. Coffee escalation
+        // 8. The synopsis rant
+        [
+          { type: 'writing the synopsis becomes harder than writing the actual book', speed: FAST_TYPE, hold: LONG_HOLD },
+        ],
+        // 9. Coffee escalation
         [
           { type: 'coffee becomes ', speed: TYPE_SPEED },
           { type: 'a personality', speed: FAST_TYPE },
@@ -191,27 +204,32 @@
           { delete: 14, speed: FAST_DELETE },
           { type: 'a whole novel apparently', speed: FAST_TYPE, hold: LONG_HOLD },
         ],
-        // 8. The dramatic one
+        // 10. Kill your darlings
+        [
+          { type: 'killing your darlings becomes ', speed: TYPE_SPEED },
+          { pause: 800 },
+          { type: 'optional', speed: SLOW_TYPE, hold: LONG_HOLD },
+        ],
+        // 11. The dramatic one
         [
           { type: "'once upon a time' becomes ", speed: TYPE_SPEED },
           { pause: 800 },
           { type: 'everything', speed: SLOW_TYPE, hold: LONG_HOLD },
         ],
-        // 9. Readers — the gateway drug
+        // 12. TBR pile
         [
-          { type: 'one more chapter becomes ', speed: TYPE_SPEED },
-          { type: 'sunrise', speed: SLOW_TYPE, hold: LONG_HOLD },
+          { type: 'your TBR pile becomes a lifestyle', hold: LONG_HOLD },
         ],
-        // 10. The quiet truth
+        // 13. The quiet truth
         [
           { type: 'your words become ', speed: TYPE_SPEED },
           { type: "someone else's favourite line", speed: TYPE_SPEED, hold: LONG_HOLD },
         ],
-        // 11. Every word — with attitude
+        // 14. Every word — with attitude
         [
           { type: 'every. single. word. pays. its. author.', speed: 90, hold: LONG_HOLD },
         ],
-        // 12. Deadlines
+        // 15. Deadlines
         [
           { type: 'deadlines become ', speed: TYPE_SPEED },
           { type: 'suggestions', speed: TYPE_SPEED },
@@ -220,7 +238,12 @@
           { pause: 300 },
           { type: 'motivation', hold: LONG_HOLD },
         ],
-        // 13. Closer
+        // 16. One more chapter
+        [
+          { type: 'one more chapter becomes ', speed: TYPE_SPEED },
+          { type: 'sunrise', speed: SLOW_TYPE, hold: LONG_HOLD },
+        ],
+        // 17. Closer
         [
           { type: 'stories find their readers', hold: LONG_HOLD },
         ],
