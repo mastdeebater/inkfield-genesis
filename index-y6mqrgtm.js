@@ -25531,6 +25531,7 @@ var FONT = `400 9px ${FONT_FAMILY}`;
 var SCENE_HOLD = 8;
 var SCENE_FADE = 1.2;
 var TOTAL_SCENE = SCENE_HOLD + SCENE_FADE;
+var TOOLTIP_TIMEOUT = 5;
 var canvas = document.getElementById("c");
 var ctx = canvas.getContext("2d");
 var W = 0;
@@ -25548,6 +25549,8 @@ var scrollDir = 0;
 var grid = [];
 var mouseCol = -1;
 var mouseRow = -1;
+var lastInteractionTime = 0;
+var tooltipOpacity = 0;
 var currentScene = 0;
 var sceneTime = 0;
 var fadeIn = 0;
@@ -25572,6 +25575,29 @@ function resize() {
     offsetY = Math.max(0, (H - gridH) / 2);
   }
 }
+function pickScrollMode() {
+  if (gridW <= W) {
+    offsetX = Math.floor((W - gridW) / 2);
+    scrollSpeed = 0;
+    scrollDir = 0;
+    scrollX = 0;
+    return;
+  }
+  const overflow = gridW - W;
+  scrollSpeed = 15;
+  const mode = Math.floor(Math.random() * 3);
+  if (mode === 0) {
+    scrollDir = 1;
+    scrollX = 0;
+  } else if (mode === 1) {
+    scrollDir = -1;
+    scrollX = overflow;
+  } else {
+    scrollDir = Math.random() < 0.5 ? 1 : -1;
+    scrollX = overflow / 2;
+  }
+  offsetX = 0;
+}
 function buildGrid(sceneIndex) {
   const scene = scenes[sceneIndex % scenes.length];
   const words = sceneTextMap[scene.name] ?? ["story"];
@@ -25583,27 +25609,7 @@ function buildGrid(sceneIndex) {
   gridW = cols * cellSize;
   gridH = rows * cellSize;
   offsetY = 0;
-  if (gridW <= W) {
-    offsetX = Math.floor((W - gridW) / 2);
-    scrollSpeed = 0;
-    scrollDir = 0;
-    scrollX = 0;
-  } else {
-    const overflow = gridW - W;
-    scrollSpeed = 15;
-    const mode = sceneIndex % 3;
-    if (mode === 0) {
-      scrollDir = 1;
-      scrollX = 0;
-    } else if (mode === 1) {
-      scrollDir = -1;
-      scrollX = overflow;
-    } else {
-      scrollDir = Math.random() < 0.5 ? 1 : -1;
-      scrollX = overflow / 2;
-    }
-    offsetX = 0;
-  }
+  pickScrollMode();
   grid = [];
   let wordIdx = 0;
   for (let r = 0;r < rows; r++) {
@@ -25627,13 +25633,14 @@ function buildGrid(sceneIndex) {
     grid.push(row);
   }
   fadeIn = 0;
+  tooltipOpacity = 0;
   const attrEl = document.getElementById("attribution");
   if (attrEl) {
     attrEl.textContent = attributions[scene.name] ?? "";
     attrEl.classList.add("visible");
   }
 }
-function update(dt) {
+function update(dt, now) {
   sceneTime += dt;
   if (fadeIn < 1)
     fadeIn = Math.min(1, fadeIn + dt / 1);
@@ -25657,7 +25664,17 @@ function update(dt) {
       scrollDir = -1;
     }
   }
-  if (!overlayShown && currentScene >= 1) {
+  if (mouseCol >= 0 && mouseRow >= 0) {
+    const timeSinceInteraction = now - lastInteractionTime;
+    if (timeSinceInteraction < TOOLTIP_TIMEOUT) {
+      tooltipOpacity = Math.min(1, tooltipOpacity + dt * 4);
+    } else {
+      tooltipOpacity = Math.max(0, tooltipOpacity - dt * 2);
+    }
+  } else {
+    tooltipOpacity = Math.max(0, tooltipOpacity - dt * 4);
+  }
+  if (!overlayShown && fadeIn > 0.8) {
     overlayShown = true;
     document.getElementById("overlay")?.classList.add("visible");
     document.getElementById("wordmark")?.classList.add("visible");
@@ -25689,7 +25706,7 @@ function render() {
       ctx.fillRect(x, y, cellSize + 0.5, cellSize + 0.5);
     }
   }
-  if (mouseCol >= 0 && mouseRow >= 0 && mouseRow < rows && mouseCol < cols) {
+  if (tooltipOpacity > 0.01 && mouseCol >= 0 && mouseRow >= 0 && mouseRow < rows && mouseCol < cols) {
     const cell = grid[mouseRow][mouseCol];
     const cx = sx + mouseCol * cellSize + cellSize / 2;
     const cy = offsetY + mouseRow * cellSize + cellSize / 2;
@@ -25699,8 +25716,10 @@ function render() {
     const textWidth = ctx.measureText(cell.text).width;
     const boxW = textWidth + padding * 2;
     const boxH = fontSize + padding * 2;
+    const isMobile = "ontouchstart" in window;
+    const tooltipOffset = isMobile ? 60 : 8;
     let boxX = cx - boxW / 2;
-    let boxY = cy - boxH - 8;
+    let boxY = cy - boxH - tooltipOffset;
     if (boxX < 2)
       boxX = 2;
     if (boxX + boxW > W - 2)
@@ -25709,11 +25728,12 @@ function render() {
       boxY = 2;
     if (boxY + boxH > H - 2)
       boxY = H - boxH - 2;
-    ctx.fillStyle = `rgba(0, 0, 0, ${alpha * 0.55})`;
+    const ta = alpha * tooltipOpacity;
+    ctx.fillStyle = `rgba(0, 0, 0, ${ta * 0.55})`;
     ctx.beginPath();
     ctx.roundRect(boxX, boxY, boxW, boxH, 4);
     ctx.fill();
-    ctx.strokeStyle = `rgba(${cell.r},${cell.g},${cell.b},${alpha * 0.5})`;
+    ctx.strokeStyle = `rgba(${cell.r},${cell.g},${cell.b},${ta * 0.5})`;
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.roundRect(boxX, boxY, boxW, boxH, 4);
@@ -25721,7 +25741,7 @@ function render() {
     const cr = Math.min(255, cell.r + 80);
     const cg = Math.min(255, cell.g + 80);
     const cb = Math.min(255, cell.b + 80);
-    ctx.fillStyle = `rgba(${cr},${cg},${cb},${alpha})`;
+    ctx.fillStyle = `rgba(${cr},${cg},${cb},${ta})`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(cell.text, boxX + boxW / 2, boxY + boxH / 2);
@@ -25732,34 +25752,29 @@ function frame(ts) {
   const t = ts / 1000;
   const dt = lastTime === 0 ? 0.016 : Math.min(t - lastTime, 0.05);
   lastTime = t;
-  update(dt);
+  update(dt, t);
   render();
   requestAnimationFrame(frame);
 }
-canvas.addEventListener("mousemove", (e) => {
+function onInteraction(clientX, clientY) {
   const sx = offsetX - scrollX;
-  mouseCol = Math.floor((e.clientX - sx) / cellSize);
-  mouseRow = Math.floor((e.clientY - offsetY) / cellSize);
+  mouseCol = Math.floor((clientX - sx) / cellSize);
+  mouseRow = Math.floor((clientY - offsetY) / cellSize);
   if (mouseCol < 0 || mouseCol >= cols || mouseRow < 0 || mouseRow >= rows) {
     mouseCol = -1;
     mouseRow = -1;
   }
-});
+  lastInteractionTime = performance.now() / 1000;
+}
+canvas.addEventListener("mousemove", (e) => onInteraction(e.clientX, e.clientY));
 canvas.addEventListener("mouseleave", () => {
   mouseCol = -1;
   mouseRow = -1;
 });
 canvas.addEventListener("touchmove", (e) => {
   const t = e.touches[0];
-  if (t) {
-    const sx = offsetX - scrollX;
-    mouseCol = Math.floor((t.clientX - sx) / cellSize);
-    mouseRow = Math.floor((t.clientY - offsetY) / cellSize);
-    if (mouseCol < 0 || mouseCol >= cols || mouseRow < 0 || mouseRow >= rows) {
-      mouseCol = -1;
-      mouseRow = -1;
-    }
-  }
+  if (t)
+    onInteraction(t.clientX, t.clientY);
 }, { passive: true });
 canvas.addEventListener("touchend", () => {
   mouseCol = -1;
