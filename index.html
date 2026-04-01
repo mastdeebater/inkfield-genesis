@@ -137,6 +137,44 @@
       const PAUSE_BEFORE_TYPE = 400;
       const HOLD = 3000;
 
+      var circleEl = document.getElementById('editor-circle');
+
+      function showEditorCircle(word) {
+        if (!circleEl || !el) return;
+        var fullText = el.textContent;
+        var wordStart = fullText.indexOf(word);
+        if (wordStart < 0) return;
+        var before = fullText.slice(0, wordStart);
+        var measureSpan = document.createElement('span');
+        measureSpan.style.cssText = window.getComputedStyle(el).cssText;
+        measureSpan.style.position = 'absolute';
+        measureSpan.style.visibility = 'hidden';
+        measureSpan.style.whiteSpace = 'pre';
+        document.body.appendChild(measureSpan);
+        measureSpan.textContent = before;
+        var leftOffset = measureSpan.offsetWidth;
+        measureSpan.textContent = word;
+        var wordWidth = measureSpan.offsetWidth;
+        document.body.removeChild(measureSpan);
+        var padX = wordWidth * 0.2;
+        var padY = 6;
+        circleEl.style.display = 'block';
+        circleEl.style.left = (leftOffset - padX) + 'px';
+        circleEl.style.top = (-padY) + 'px';
+        circleEl.style.width = (wordWidth + padX * 2) + 'px';
+        circleEl.style.height = (el.offsetHeight + padY * 2) + 'px';
+        circleEl.classList.remove('animate');
+        void circleEl.offsetWidth;
+        circleEl.classList.add('animate');
+      }
+
+      function hideEditorCircle() {
+        if (circleEl) {
+          circleEl.style.display = 'none';
+          circleEl.classList.remove('animate');
+        }
+      }
+
       // Sequence of actions. Each is an array of steps:
       // { type: 'text', speed?, hold? }
       // { delete: numberOfChars, speed? }
