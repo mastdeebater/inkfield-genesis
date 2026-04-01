@@ -24545,11 +24545,18 @@ function renderSentenceTooltip(cell, cx, cy, alpha) {
   let highlighted = false;
   for (const line of layout.lines) {
     const lineWords = line.text.split(/(\s+)/);
+    let rawTotal = 0;
+    ctx.font = TOOLTIP_FONT;
+    for (const fragment of lineWords) {
+      rawTotal += ctx.measureText(fragment).width;
+    }
+    const scaleX = rawTotal > 0 ? line.width / rawTotal : 1;
     let drawX = boxX + padX;
     for (const fragment of lineWords) {
+      ctx.font = TOOLTIP_FONT;
+      const fragW = ctx.measureText(fragment).width * scaleX;
       if (fragment.trim().length === 0) {
-        ctx.font = TOOLTIP_FONT;
-        drawX += ctx.measureText(fragment).width;
+        drawX += fragW;
         continue;
       }
       const stripped = fragment.replace(/^[^a-zA-Z0-9]*|[^a-zA-Z0-9]*$/g, "");
@@ -24566,7 +24573,7 @@ function renderSentenceTooltip(cell, cx, cy, alpha) {
       ctx.textAlign = "left";
       ctx.textBaseline = "middle";
       ctx.fillText(fragment, drawX, lineY);
-      drawX += ctx.measureText(fragment).width;
+      drawX += fragW;
     }
     lineY += TOOLTIP_LINE_HEIGHT;
   }
