@@ -100,24 +100,24 @@
 
   <script>
     (function() {
-      const prefix = 'Where ';
-      const el = document.getElementById('typewriter');
+      var prefix = 'Where ';
+      var el = document.getElementById('typewriter');
       if (!el) return;
 
-      const TYPE_SPEED = 60;
-      const FAST_TYPE = 30;
-      const SLOW_TYPE = 180;
-      const DELETE_SPEED = 35;
-      const FAST_DELETE = 18;
-      const PAUSE_BEFORE_TYPE = 400;
-      const HOLD = 3000;
+      var TYPE_SPEED = 60;
+      var FAST_TYPE = 30;
+      var SLOW_TYPE = 180;
+      var DELETE_SPEED = 35;
+      var FAST_DELETE = 18;
+      var PAUSE_BEFORE_TYPE = 400;
+      var HOLD = 3000;
       }
 
       // Sequence of actions. Each is an array of steps:
       // { type: 'text', speed?, hold? }
       // { delete: numberOfChars, speed? }
       // { pause: ms }
-      const sequence = [
+      var sequence = [
         // 1. Opening — clean
         [
           { type: 'words become worlds', hold: HOLD },
@@ -180,12 +180,12 @@
         ],
       ];
 
-      let seqIdx = 0;
-      let currentText = sequence[0][sequence[0].length - 1].type || '';
+      var seqIdx = 0;
+      var currentText = sequence[0][sequence[0].length - 1].type || '';
       el.textContent = prefix + currentText;
 
       function typeText(text, speed, onDone) {
-        let j = 0;
+        var j = 0;
         function tick() {
           if (j >= text.length) { onDone(); return; }
           j++;
@@ -197,7 +197,7 @@
       }
 
       function deleteChars(count, speed, onDone) {
-        let i = 0;
+        var i = 0;
         function tick() {
           if (i >= count || currentText.length === 0) { onDone(); return; }
           currentText = currentText.slice(0, -1);
