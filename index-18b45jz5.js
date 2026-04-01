@@ -24562,12 +24562,11 @@ function renderSentenceTooltip(cell, cx, cy, alpha) {
       const stripped = fragment.replace(/^[^a-zA-Z0-9]*|[^a-zA-Z0-9]*$/g, "");
       const targetStripped = targetWord.replace(/^[^a-zA-Z0-9]*|[^a-zA-Z0-9]*$/g, "");
       const isTarget = !highlighted && stripped === targetStripped;
+      ctx.font = TOOLTIP_FONT;
       if (isTarget) {
-        ctx.font = TOOLTIP_HIGHLIGHT_FONT;
         ctx.fillStyle = `rgba(255, 235, 190, ${ta})`;
         highlighted = true;
       } else {
-        ctx.font = TOOLTIP_FONT;
         ctx.fillStyle = `rgba(190, 180, 165, ${ta * 0.75})`;
       }
       ctx.textAlign = "left";
