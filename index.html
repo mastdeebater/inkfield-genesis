@@ -100,13 +100,15 @@
 
   <script>
     (function() {
-      const phrases = [
-        'words become worlds',
-        'writers become authors',
-        'readers become fans',
-        'agents find authors',
-        'readers become authors',
-        'stories find readers',
+      // Each entry: [text, holdMs] or a special action object
+      // { fake: 'text to type first', pause: ms, then: 'real text' }
+      const sequence = [
+        { text: 'words become worlds', hold: 3000 },
+        { text: 'writers become authors', hold: 3000 },
+        { text: 'readers become fans', hold: 3000 },
+        { fake: 'authors find...', pause: 1200, then: 'agents find authors', hold: 3000 },
+        { text: 'readers become authors', hold: 3000 },
+        { text: 'stories find readers', hold: 3000 },
       ];
       const prefix = 'Where ';
       const el = document.getElementById('typewriter');
@@ -114,46 +116,77 @@
 
       const TYPE_SPEED = 60;
       const DELETE_SPEED = 35;
-      const HOLD_TIME = 3000;
       const PAUSE_BEFORE_TYPE = 400;
 
-      let phraseIdx = 0;
-      let charIdx = phrases[0].length;
-      el.textContent = prefix + phrases[0];
+      let seqIdx = 0;
+      el.textContent = prefix + sequence[0].text;
 
-      function nextPhrase() {
-        const current = phrases[phraseIdx];
-        let i = current.length;
-
-        // Delete current phrase char by char
-        function deleteChar() {
-          if (i <= 0) {
-            phraseIdx = (phraseIdx + 1) % phrases.length;
-            setTimeout(typeChar, PAUSE_BEFORE_TYPE);
-            return;
-          }
-          i--;
-          el.textContent = prefix + current.slice(0, i);
-          setTimeout(deleteChar, DELETE_SPEED);
-        }
-
-        // Type next phrase char by char
+      function typeText(text, onDone) {
         let j = 0;
-        function typeChar() {
-          const next = phrases[phraseIdx];
-          if (j >= next.length) {
-            setTimeout(nextPhrase, HOLD_TIME);
-            return;
-          }
+        function tick() {
+          if (j >= text.length) { onDone(); return; }
           j++;
-          el.textContent = prefix + next.slice(0, j);
-          setTimeout(typeChar, TYPE_SPEED);
+          el.textContent = prefix + text.slice(0, j);
+          setTimeout(tick, TYPE_SPEED);
         }
-
-        deleteChar();
+        tick();
       }
 
-      setTimeout(nextPhrase, HOLD_TIME);
+      function deleteText(text, onDone) {
+        let i = text.length;
+        function tick() {
+          if (i <= 0) { onDone(); return; }
+          i--;
+          el.textContent = prefix + text.slice(0, i);
+          setTimeout(tick, DELETE_SPEED);
+        }
+        tick();
+      }
+
+      function runEntry() {
+        const entry = sequence[seqIdx % sequence.length];
+        const currentText = el.textContent.slice(prefix.length);
+
+        // Delete current text
+        deleteText(currentText, function() {
+          setTimeout(function() {
+            if (entry.fake) {
+              // Type the fake text first
+              typeText(entry.fake, function() {
+                // Pause to let it sink in...
+                setTimeout(function() {
+                  // Delete the fake text
+                  deleteText(entry.fake, function() {
+                    setTimeout(function() {
+                      // Type the real text
+                      typeText(entry.then, function() {
+                        setTimeout(function() {
+                          seqIdx++;
+                          runEntry();
+                        }, entry.hold || 3000);
+                      });
+                    }, PAUSE_BEFORE_TYPE);
+                  });
+                }, entry.pause || 1000);
+              });
+            } else {
+              // Normal: just type it
+              typeText(entry.text, function() {
+                setTimeout(function() {
+                  seqIdx++;
+                  runEntry();
+                }, entry.hold || 3000);
+              });
+            }
+          }, PAUSE_BEFORE_TYPE);
+        });
+      }
+
+      // First phrase is already displayed, wait then start cycling
+      setTimeout(function() {
+        seqIdx = 1;
+        runEntry();
+      }, sequence[0].hold);
     })();
   </script>
 </body>
